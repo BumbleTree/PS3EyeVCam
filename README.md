@@ -52,6 +52,8 @@ If you want to cleanly remove it from your system:
 
 ### Accessing Settings
 Once installed, look for the **PS3 Eye camera icon** in your Windows System Tray (near the clock).
+<img width="401" height="174" alt="SystemTray" src="https://github.com/user-attachments/assets/694ab46e-8f88-4642-b00e-b44de9beb11a" />
+
 * **Right-click the tray icon** to:
   * Open **Settings** (or double-click the icon).
   * Toggle **Start with Windows** on/off.
@@ -61,6 +63,8 @@ Once installed, look for the **PS3 Eye camera icon** in your Windows System Tray
   * Adjust **White Balance** settings.
   * Set **Video Presets** (e.g., standard 640×480 @ 60fps up to 75fps, or high-speed 320×240 up to 187fps).
   * Enable **Mirroring** (horizontal or vertical flip).
+<img width="376" height="420" alt="camera settings (1)" src="https://github.com/user-attachments/assets/71843b34-0c2c-494c-b3e3-68eac5a2a482" />
+
 
 *Note: If a program is currently streaming video, mode/preset changes are queued and will automatically apply as soon as you close/restart the stream.*
 
