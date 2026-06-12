@@ -113,6 +113,29 @@ void DownscaleNv12_2x(const uint8_t* src, uint8_t* dst, uint32_t srcW, uint32_t 
     }
 }
 
+void Nv12ToYuy2(const uint8_t* src, uint8_t* dst, uint32_t w, uint32_t h)
+{
+    const uint8_t* srcY = src;
+    const uint8_t* srcUV = src + w * h;
+    
+    for (uint32_t y = 0; y < h; ++y)
+    {
+        const uint8_t* rowY = srcY + y * w;
+        const uint8_t* rowUV = srcUV + (y / 2) * w;
+        uint32_t* rowDst = reinterpret_cast<uint32_t*>(dst + y * w * 2);
+        
+        for (uint32_t x = 0; x < w; x += 2)
+        {
+            uint32_t y0 = rowY[x];
+            uint32_t y1 = rowY[x + 1];
+            uint32_t u  = rowUV[x];
+            uint32_t v  = rowUV[x + 1];
+            
+            rowDst[x / 2] = y0 | (u << 8) | (y1 << 16) | (v << 24);
+        }
+    }
+}
+
 } // namespace
 
 HRESULT MediaStream::Initialize()
@@ -140,10 +163,11 @@ HRESULT MediaStream::Initialize()
     _height = defaultHeight;
     _fpsNum = defaultFpsNum;
     _fpsDen = defaultFpsDen;
+    _subtype = MFVideoFormat_NV12;
     _frameBytes = framebus::Nv12Bytes(_width, _height);
     _frameDuration = MulDiv(10000000, _fpsDen, _fpsNum);
 
-    _staging.reset(new (std::nothrow) uint8_t[_frameBytes]);
+    _staging.reset(new (std::nothrow) uint8_t[framebus::Nv12Bytes(_width, _height)]);
     if (!_staging)
         return E_OUTOFMEMORY;
     FillBlack();
@@ -167,19 +191,29 @@ HRESULT MediaStream::Initialize()
 
     for (int i = 0; i < kVideoModeCount; ++i)
     {
-        ComPtr<IMFMediaType> mt;
-        hr = CreateMediaType(kVideoModes[i].width, kVideoModes[i].height, kVideoModes[i].fps, 1, &mt);
+        // 1. Add NV12 (default)
+        ComPtr<IMFMediaType> mtNV12;
+        hr = CreateMediaType(kVideoModes[i].width, kVideoModes[i].height, kVideoModes[i].fps, 1, MFVideoFormat_NV12, &mtNV12);
         if (SUCCEEDED(hr))
         {
-            typesList.push_back(mt.Get());
-            mt->AddRef();
+            typesList.push_back(mtNV12.Get());
+            mtNV12->AddRef();
 
             if (kVideoModes[i].width == defaultWidth &&
                 kVideoModes[i].height == defaultHeight &&
                 kVideoModes[i].fps == defaultFpsNum)
             {
-                defaultType = mt;
+                defaultType = mtNV12;
             }
+        }
+
+        // 2. Add YUY2
+        ComPtr<IMFMediaType> mtYUY2;
+        hr = CreateMediaType(kVideoModes[i].width, kVideoModes[i].height, kVideoModes[i].fps, 1, MFVideoFormat_YUY2, &mtYUY2);
+        if (SUCCEEDED(hr))
+        {
+            typesList.push_back(mtYUY2.Get());
+            mtYUY2->AddRef();
         }
     }
 
@@ -210,22 +244,33 @@ HRESULT MediaStream::Initialize()
     return S_OK;
 }
 
-HRESULT MediaStream::CreateMediaType(uint32_t width, uint32_t height, uint32_t fpsNum, uint32_t fpsDen, IMFMediaType** ppType)
+HRESULT MediaStream::CreateMediaType(uint32_t width, uint32_t height, uint32_t fpsNum, uint32_t fpsDen, GUID subtype, IMFMediaType** ppType)
 {
     ComPtr<IMFMediaType> mt;
     HRESULT hr = MFCreateMediaType(&mt);
     if (FAILED(hr)) return hr;
 
     mt->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    mt->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
+    mt->SetGUID(MF_MT_SUBTYPE, subtype);
     MFSetAttributeSize(mt.Get(), MF_MT_FRAME_SIZE, width, height);
     MFSetAttributeRatio(mt.Get(), MF_MT_FRAME_RATE, fpsNum, fpsDen);
     MFSetAttributeRatio(mt.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
     mt->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
     mt->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE);
     mt->SetUINT32(MF_MT_FIXED_SIZE_SAMPLES, TRUE);
-    mt->SetUINT32(MF_MT_SAMPLE_SIZE, framebus::Nv12Bytes(width, height));
-    mt->SetUINT32(MF_MT_DEFAULT_STRIDE, width);
+
+    uint32_t sampleSize = 0;
+    if (subtype == MFVideoFormat_NV12)
+    {
+        sampleSize = framebus::Nv12Bytes(width, height);
+        mt->SetUINT32(MF_MT_DEFAULT_STRIDE, width);
+    }
+    else if (subtype == MFVideoFormat_YUY2)
+    {
+        sampleSize = width * height * 2;
+        mt->SetUINT32(MF_MT_DEFAULT_STRIDE, width * 2);
+    }
+    mt->SetUINT32(MF_MT_SAMPLE_SIZE, sampleSize);
 
     *ppType = mt.Detach();
     return S_OK;
@@ -234,9 +279,10 @@ HRESULT MediaStream::CreateMediaType(uint32_t width, uint32_t height, uint32_t f
 void MediaStream::FillBlack()
 {
     // NV12 black: luma 0x10, chroma 0x80
+    const uint32_t nv12Size = framebus::Nv12Bytes(_width, _height);
     memset(_staging.get(), 0x10, static_cast<size_t>(_width) * _height);
     memset(_staging.get() + static_cast<size_t>(_width) * _height, 0x80,
-           static_cast<size_t>(_frameBytes) - static_cast<size_t>(_width) * _height);
+           static_cast<size_t>(nv12Size) - static_cast<size_t>(_width) * _height);
 }
 
 // Stamp the keepalive (and optionally pulse the wake event) so the host knows
@@ -277,13 +323,26 @@ HRESULT MediaStream::Start(const PROPVARIANT* startPosition)
         {
             MFGetAttributeSize(currentType.Get(), MF_MT_FRAME_SIZE, &_width, &_height);
             MFGetAttributeRatio(currentType.Get(), MF_MT_FRAME_RATE, &_fpsNum, &_fpsDen);
-            _frameBytes = framebus::Nv12Bytes(_width, _height);
+            
+            GUID subtype = MFVideoFormat_NV12;
+            currentType->GetGUID(MF_MT_SUBTYPE, &subtype);
+            _subtype = subtype;
+
+            if (subtype == MFVideoFormat_YUY2)
+            {
+                _frameBytes = _width * _height * 2;
+            }
+            else
+            {
+                _frameBytes = framebus::Nv12Bytes(_width, _height);
+            }
             _frameDuration = MulDiv(10000000, _fpsDen, _fpsNum);
-            _staging.reset(new (std::nothrow) uint8_t[_frameBytes]);
+
+            _staging.reset(new (std::nothrow) uint8_t[framebus::Nv12Bytes(_width, _height)]);
             if (!_staging)
                 return E_OUTOFMEMORY;
             FillBlack();
-            VCamTrace(L"stream: start with format %ux%u @ %u/%u", _width, _height, _fpsNum, _fpsDen);
+            VCamTrace(L"stream: start with format %ux%u @ %u/%u (subtype YUY2=%d)", _width, _height, _fpsNum, _fpsDen, (subtype == MFVideoFormat_YUY2));
         }
     }
 
@@ -467,28 +526,35 @@ HRESULT MediaStream::DeliverSample(IUnknown* token)
                 const uint32_t busHeight = fmt.height;
                 const uint32_t busFrameBytes = framebus::Nv12Bytes(busWidth, busHeight);
                 
-                const LONG64 id = _bus.TryReadNewer(_busStaging.get(), busFrameBytes, _lastFrameId);
-                if (id != 0)
+                if (busWidth == _width && busHeight == _height)
                 {
-                    _lastFrameId = id;
-                    
-                    if (busWidth == _width && busHeight == _height)
+                    const LONG64 id = _bus.TryReadNewer(_staging.get(), busFrameBytes, _lastFrameId);
+                    if (id != 0)
                     {
-                        memcpy(_staging.get(), _busStaging.get(), _frameBytes);
+                        _lastFrameId = id;
+                        break;
                     }
-                    else if (busWidth == 320 && busHeight == 240 && _width == 640 && _height == 480)
+                }
+                else
+                {
+                    const LONG64 id = _bus.TryReadNewer(_busStaging.get(), busFrameBytes, _lastFrameId);
+                    if (id != 0)
                     {
-                        UpscaleNv12_2x(_busStaging.get(), _staging.get(), 320, 240);
+                        _lastFrameId = id;
+                        if (busWidth == 320 && busHeight == 240 && _width == 640 && _height == 480)
+                        {
+                            UpscaleNv12_2x(_busStaging.get(), _staging.get(), 320, 240);
+                        }
+                        else if (busWidth == 640 && busHeight == 480 && _width == 320 && _height == 240)
+                        {
+                            DownscaleNv12_2x(_busStaging.get(), _staging.get(), 640, 480);
+                        }
+                        else
+                        {
+                            FillBlack();
+                        }
+                        break;
                     }
-                    else if (busWidth == 640 && busHeight == 480 && _width == 320 && _height == 240)
-                    {
-                        DownscaleNv12_2x(_busStaging.get(), _staging.get(), 640, 480);
-                    }
-                    else
-                    {
-                        FillBlack();
-                    }
-                    break;
                 }
             }
         }
@@ -508,7 +574,14 @@ HRESULT MediaStream::DeliverSample(IUnknown* token)
         hr = buffer->Lock(&data, &maxLen, nullptr);
         if (SUCCEEDED(hr))
         {
-            memcpy(data, _staging.get(), _frameBytes);
+            if (_subtype == MFVideoFormat_YUY2)
+            {
+                Nv12ToYuy2(_staging.get(), data, _width, _height);
+            }
+            else
+            {
+                memcpy(data, _staging.get(), _frameBytes);
+            }
             buffer->Unlock();
             buffer->SetCurrentLength(_frameBytes);
         }

@@ -128,7 +128,7 @@ public:
     STDMETHODIMP KsEvent(void*, ULONG, void*, ULONG, ULONG*) override;
 
 private:
-    HRESULT CreateMediaType(uint32_t width, uint32_t height, uint32_t fpsNum, uint32_t fpsDen, IMFMediaType** ppType);
+    HRESULT CreateMediaType(uint32_t width, uint32_t height, uint32_t fpsNum, uint32_t fpsDen, GUID subtype, IMFMediaType** ppType);
     HRESULT DeliverSample(IUnknown* token);
     void    FillBlack();
     void    PingActivity(bool forceWakeSignal);  // caller must hold _lock
@@ -146,6 +146,7 @@ private:
     bool            _shutdown = false;
 
     // Negotiated/advertised format (fixed for the lifetime of the source).
+    GUID     _subtype = MFVideoFormat_NV12;
     uint32_t _width = 640, _height = 480, _fpsNum = 60, _fpsDen = 1;
     uint32_t _frameBytes = 0;
     LONGLONG _frameDuration = 166667;  // 100ns units

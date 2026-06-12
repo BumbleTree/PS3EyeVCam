@@ -12,7 +12,7 @@ Once installed, the PS3 Eye appears to apps like **Discord, Zoom, OBS, RPCS3 (PS
                               │                                                                 │
                               │                                                                 ▼
 PS3 Eye (Composite Device) ───┤                                                           PS3EyeVCam.dll (in Camera Frame Server)
-                              │                                                                 │
+                              │                                                                 │  NV12 / YUY2 (on-the-fly)
                               │                                                                 ▼
                               │                                             "PS3 Eye (Windows Virtual Camera)" in every app
                               │
@@ -95,6 +95,7 @@ Once installed, look for the **PS3 Eye camera icon** in your Windows System Tray
 
 * **Sub-Millisecond Latency:** Video frames are passed from the capture thread to the virtual camera DLL via a lock-free shared-memory queue (`FrameBus`). There are no context switches or IPC blocking events between the reader and writer, guaranteeing sub-millisecond transport latency.
 * **On-Demand Scaling:** When the camera preset and the application's requested resolution mismatch (e.g., camera is capturing at 320x240 but Discord requests 640x480), the DLL performs fast 2x nearest-neighbor scaling on the fly in `< 0.2ms` (consuming `< 2%` of a single CPU core even at 187 FPS). No scaling is performed when the formats match.
+* **On-Demand Format Conversion:** The DLL advertises both modern `NV12` and native `YUY2` (YUYV) formats. If a client application (such as the RPCS3 emulator) requests the video stream in `YUY2` format (matching the original PS3 Eye YUYV format), the DLL automatically performs a fast, on-the-fly conversion from the shared-memory `NV12` frame buffer to `YUY2` before delivery.
 * **Zero-Resource Idle State:** If no client applications are capturing from the virtual camera, the background tray daemon automatically powers down the physical camera (red LED turns off) after 3 seconds. While idle, the app consumes **0% CPU** and puts the USB controller in a low-power state.
 * **Optimized Bandwidth:** In high-speed 320x240 modes, raw data is sent across the memory bus at just 21 MB/s. Scaling occurs within the client process on-demand, saving system memory bandwidth.
 
