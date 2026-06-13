@@ -23,13 +23,13 @@ PS3 Eye (Composite Device) ───┤                                         
 
 ## What It Does For You
 
-* **Dynamic Multi-Camera Routing:** Supports up to 8 simultaneous physical PS3 Eye cameras. The system tray controller registers the virtual camera (`IMFVirtualCamera`) dynamically *only* when a physical camera is connected to a slot, and unregisters it on removal. This ensures client applications see exactly the number of cameras physically plugged in. Camera arrival and removal are event-driven via WinUSB device interface notifications fanned out to per-slot controllers (with a 5-second polling fallback for empty slots).
-* **Automatic Sleep & Wake:** The cameras only turn on when a program is actually using them. A physical camera is powered down (0% CPU, LED off) when not in use. It wakes up in under a second when needed.
-* **Built-in Microphone Array Support:** Exposes the PS3 Eye's high-quality 4-channel microphone array as a standard Windows audio input device (**"USB Camera-B4.09.24.1"**) using Windows' native USB Audio Class driver, working seamlessly out-of-the-box.
-* **Easy Access Settings:** Control camera settings directly from a system tray icon.
-* **Settings Persistence:** Mirroring, gain, exposure, and white balance settings are saved and remembered automatically.
-* **Automatic Silent Start:** Starts automatically when you sign into Windows without triggering any popups (UAC prompt-free).
-* **Zero Driver Hassles:** No need to download Zadig or other custom installer programs. The installation script handles the entire video driver setup automatically.
+* **Connect Up to 8 Cameras:** Use up to 8 PS3 Eye cameras at the same time. The virtual cameras appear in your apps automatically only when a physical camera is plugged in, and disappear when unplugged so you never see clutter.
+* **Smart Sleep & Wake:** The physical cameras automatically power down (turning off the red LED and using 0% CPU) when not in use by any app, and wake up instantly when needed.
+* **Integrated Microphone Support:** Works seamlessly with the PS3 Eye's built-in 4-channel microphone array, exposing it as a standard Windows recording device (**"USB Camera-B4.09.24.1"**) out-of-the-box.
+* **Quick Control from System Tray:** Adjust camera settings easily via a menu right next to your Windows clock.
+* **Auto-Saved Settings:** Your adjustments for mirroring, gain, exposure, and white balance are automatically remembered for each camera.
+* **Silent Windows Startup:** Launches quietly when you log in without showing any annoying security prompts.
+* **No Complicated Setup:** You don't need to manually configure drivers or download third-party tools like Zadig—the installer does everything for you.
 
 ---
 
@@ -97,24 +97,37 @@ Once installed, look for the **PS3 Eye camera icon** in your Windows System Tray
 
 ## Performance, Latency & Resources
 
-* **Sub-Millisecond Latency via Auto-Reset Events:** Video frames are passed from the capture thread to the virtual camera DLL via a lock-free shared-memory queue (`FrameBus`). The reader waits on a per-camera auto-reset event (`Global\PS3EyeVCam[N].FrameReady`) with restricted ACLs rather than polling or sleeping, avoiding the 15.6 ms system timer quantum. This allows high-speed modes (100–187 fps) to achieve their full target framerate with sub-millisecond latency.
-* **On-Demand Scaling:** When the camera preset and the application's requested resolution mismatch (e.g., camera is capturing at 320x240 but Discord requests 640x480), the DLL scales 2x on the fly: bilinear interpolation when upscaling and a 2x2 box filter when downscaling, both in integer math in well under a millisecond (`< 2%` of a single CPU core even at 187 FPS). No scaling is performed when the formats match.
-* **Native Original Format, On-Demand Conversion:** The shared-memory frame buffer carries `YUY2` (YUYV 4:2:2) — the PS3 Eye's original output format — preserving the sensor's full vertical chroma resolution end to end. A client requesting `YUY2` (such as the RPCS3 emulator) receives the camera frame byte-for-byte with no conversion at all; clients using the modern `NV12` format get a proper chroma-averaged 4:2:2 → 4:2:0 conversion performed on the fly at delivery time.
-* **Zero-Resource Idle State:** If no client applications are capturing from the virtual camera, the background tray daemon automatically powers down the physical camera (red LED turns off) after 3 seconds. While idle, the app consumes **0% CPU** and puts the USB controller in a low-power state.
-* **Optimized Bandwidth:** In high-speed 320x240 modes, raw data is sent across the memory bus at just 29 MB/s. Scaling occurs within the client process on-demand, saving system memory bandwidth.
+* **Ultra-Low Latency:** Delivers video frames instantly to your apps with no noticeable delay or lag.
+* **High Framerates:** Supports standard 60 FPS (up to 75 FPS) at 640×480, and high-speed modes up to 187 FPS at 320×240.
+* **Minimal CPU Impact:** Highly optimized video processing uses negligible CPU, even in high-speed modes.
+* **Zero Idle Resource Usage:** When no apps are using the camera, the background system uses 0% CPU and puts the camera into low-power mode.
 
 ---
 
 ## Architecture & Technical Notes (For Developers)
 
-* **Multi-Camera Routing:** The host daemon spawns an independent thread for each physical camera `i` (0 to 7) mapped dynamically. Each thread registers a virtual camera using the static class ID `CLSID_PS3EyeVCams[i]`, and communicates over custom slot-specific channels `Global\PS3EyeVCam[i].FrameBus` and `Global\PS3EyeVCam[i].Control`.
+### Multi-Camera Routing
+* The host daemon spawns an independent thread for each physical camera `i` (0 to 7) mapped dynamically. 
+* Each thread registers a virtual camera using the static class ID `CLSID_PS3EyeVCams[i]`, and communicates over custom slot-specific IPC channels: `Global\PS3EyeVCam[i].FrameBus` and `Global\PS3EyeVCam[i].Control`.
+* The virtual camera registers (`IMFVirtualCamera`) dynamically *only* when a physical camera is connected to a slot, and unregisters it on removal. This ensures client applications see exactly the number of cameras physically plugged in. Camera arrival and removal are event-driven via WinUSB device interface notifications fanned out to per-slot controllers (with a 5-second polling fallback for empty slots).
+
+### High-Performance IPC (FrameBus)
+* **Sub-Millisecond Latency via Auto-Reset Events:** Video frames are passed from the capture thread to the virtual camera DLL via a lock-free shared-memory queue (`FrameBus`). The reader waits on a per-camera auto-reset event (`Global\PS3EyeVCam[N].FrameReady`) with restricted ACLs rather than polling or sleeping, avoiding the 15.6 ms system timer quantum. This allows high-speed modes (100–187 fps) to achieve their full target framerate with sub-millisecond latency.
+* **Sleep/Wake Coordination:** Sleep/wake state is coordinated via a shared keepalive timestamp (`common\ControlBus.h`). If the virtual camera DLL stops requesting frames, the tray app puts the hardware to sleep after ~3 seconds.
+
+### On-the-Fly Image Processing & Color Conversion
+* **Fused Debayering Pipeline:** To minimize CPU and memory footprint, `ps3eye.cpp` uses a fused single-pass Bayer-to-YUY2 debayering pipeline that outputs directly to BT.601 YUY2 via a 1.9 KB cache-resident row scratch buffer, completely bypassing the need for a 1.2 MB BGRA intermediate buffer.
+* **Native Original Format, On-Demand Conversion:** The shared-memory frame buffer carries `YUY2` (YUYV 4:2:2) — the PS3 Eye's original output format — preserving the sensor's full vertical chroma resolution end to end. A client requesting `YUY2` (such as the RPCS3 emulator) receives the camera frame byte-for-byte with no conversion at all; clients using the modern `NV12` format get a proper chroma-averaged 4:2:2 → 4:2:0 conversion performed on the fly at delivery time.
+* **On-Demand Scaling:** When the camera preset and the application's requested resolution mismatch (e.g., camera is capturing at 320x240 but Discord requests 640x480), the DLL scales 2x on the fly: bilinear interpolation when upscaling and a 2x2 box filter when downscaling, both in integer math in well under a millisecond (negligible CPU usage even at 187 FPS). No scaling is performed when the formats match.
+* **Optimized Bandwidth:** In high-speed 320x240 modes, raw data is sent across the memory bus at just 29 MB/s. Scaling occurs within the client process on-demand, saving system memory bandwidth.
+
+### USB Bandwidth & Device Configuration
 * **USB Bandwidth Bottlenecks:** Each PS3 Eye camera requires ~185 Mbps of USB bandwidth at 640x480 @ 60 FPS. Although modern PCs use USB 3.x (xHCI) ports, the PS3 Eye is a USB 2.0 High-Speed device and is restricted to the USB 2.0 protocol layer, which shares a 480 Mbps bandwidth pool on the controller's High-Speed bus. A single physical controller can therefore support at most 2 cameras before saturating the bus. To run 3 to 8 cameras concurrently, you must distribute the cameras across separate USB controllers (e.g., separating them between rear motherboard ports, front panel ports, or dedicated PCIe USB expansion cards).
-* The PS3 Eye is a composite USB device. Interface 0 (`MI_00`) handles video streaming via WinUSB and the tray app, while Interface 1 (`MI_01`) is automatically mapped to standard Windows USB Audio (`usbaudio.sys`) to expose the 4-channel microphone array.
-* The virtual camera media source DLL (`PS3EyeVCam.dll`) runs inside the **Camera Frame Server service** (`LOCAL SERVICE`).
-* Video frames are written by the tray app (as `YUY2`, the camera's native 4:2:2 format) and read by the DLL via a high-performance lock-free shared memory queue (`Global\PS3EyeVCam[0-7].FrameBus`). To minimize CPU and memory footprint, `ps3eye.cpp` uses a fused single-pass Bayer-to-YUY2 debayering pipeline that outputs directly to BT.601 YUY2 via a 1.9 KB cache-resident row scratch buffer, completely bypassing the need for a 1.2 MB BGRA intermediate buffer.
-* Sleep/wake state is coordinated via a shared keepalive timestamp (`common\ControlBus.h`). If the virtual camera DLL stops requesting frames, the tray app puts the hardware to sleep after ~3 seconds.
-* The startup task uses the `ITaskService` COM API instead of `schtasks.exe` to bypass battery limits and execution duration limits.
-* The tray app requires admin rights to create objects in the `Global\` kernel namespace.
+* **Composite Device Mapping:** The PS3 Eye is a composite USB device. Interface 0 (`MI_00`) handles video streaming via WinUSB and the tray app, while Interface 1 (`MI_01`) is automatically mapped to standard Windows USB Audio (`usbaudio.sys`) to expose the 4-channel microphone array.
+
+### System Integration & OS Details
+* **Security & Permissions:** The virtual camera media source DLL (`PS3EyeVCam.dll`) runs inside the **Camera Frame Server service** (`LOCAL SERVICE`). The tray app requires admin rights to create IPC objects in the `Global\` kernel namespace.
+* **Startup Task:** The startup task uses the `ITaskService` COM API instead of `schtasks.exe` to bypass battery limits and execution duration limits.
 
 ---
 
