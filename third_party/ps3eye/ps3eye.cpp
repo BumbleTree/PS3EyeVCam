@@ -1,5 +1,6 @@
 // source code from https://github.com/inspirit/PS3EYEDriver
 #include "ps3eye.h"
+#include <string>
 
 // Get rid of annoying zero length structure warnings from libusb.h in MSVC
 
@@ -79,10 +80,8 @@
 	}
 #endif
 
-#ifdef _MSC_VER
-#pragma warning (disable: 4996) // 'This function or variable may be unsafe': snprintf
-#define snprintf _snprintf
-#endif
+// PS3EyeVCam patch: the old `#define snprintf _snprintf` shim is gone --
+// VS2015+ ships a conforming snprintf and the macro broke <cstdio>.
 
 #if defined(DEBUG) && 0
 #define debug(...) fprintf(stdout, __VA_ARGS__)
@@ -289,11 +288,18 @@ static uint8_t find_ep(struct libusb_device *device)
 
     if (!config) return 0;
 
+    // PS3EyeVCam patch: only accept an exact interface-0 match; the old code
+    // fell through to the LAST interface (or dereferenced NULL on a
+    // zero-interface config) when interface 0 was absent.
     for (i = 0; i < config->bNumInterfaces; i++) {
-        altsetting = config->interface[i].altsetting;
-        if (altsetting[0].bInterfaceNumber == 0) {
+        if (config->interface[i].altsetting[0].bInterfaceNumber == 0) {
+            altsetting = config->interface[i].altsetting;
             break;
         }
+    }
+    if (altsetting == NULL) {
+        libusb_free_config_descriptor(config);
+        return 0;
     }
 
     for (i = 0; i < altsetting->bNumEndpoints; i++) {
@@ -321,18 +327,21 @@ class USBMgr
 	 ~USBMgr();
 
 	static std::shared_ptr<USBMgr>  instance();
-    int listDevices(std::vector<PS3EYECam::PS3EYERef>& list);
 	void cameraStarted();
 	void cameraStopped();
-
-    static std::shared_ptr<USBMgr>  sInstance;
-    static int                      sTotalDevices;
+	libusb_context* getContext() const { return usb_context; }
 
  private:   
     libusb_context*					usb_context;
 	std::thread						update_thread;
 	std::atomic_bool				exit_signaled;
-	std::atomic_int					active_camera_count;
+	int								active_camera_count;
+	// PS3EyeVCam patch: serializes the camera-count transitions and the
+	// transfer-thread start/join. With several capture threads waking and
+	// sleeping cameras independently, "last camera stopped" (join) can race
+	// "first camera started" (assign) on update_thread, which is UB on a
+	// joinable std::thread.
+	std::mutex						thread_control_mutex;
 
     USBMgr(const USBMgr&);
     void operator=(const USBMgr&);
@@ -342,15 +351,11 @@ class USBMgr
 	void transferThreadFunc();
 };
 
-std::shared_ptr<USBMgr> USBMgr::sInstance;
-int                     USBMgr::sTotalDevices = 0;
-
 USBMgr::USBMgr() 
 {
 	exit_signaled = false;
 	active_camera_count = 0;
     libusb_init(&usb_context);
-    libusb_set_debug(usb_context, 1);
 }
 
 USBMgr::~USBMgr()
@@ -361,20 +366,25 @@ USBMgr::~USBMgr()
 
 std::shared_ptr<USBMgr> USBMgr::instance()
 {
-    if( !sInstance ) {
-        sInstance = std::shared_ptr<USBMgr>( new USBMgr );
-    }
-    return sInstance;
+	// Thread-safe C++11 magic-static initialization. Every PS3EYECam keeps a
+	// shared_ptr (mgrPtr), so the manager outlives all cameras.
+	static std::shared_ptr<USBMgr> sInstance(new USBMgr);
+	return sInstance;
 }
 
+// NOTE: cameraStopped() joins the libusb event thread. That is safe only
+// because nothing running on the event thread (transfer callbacks) ever calls
+// cameraStarted()/cameraStopped() -- see transfer_completed_callback.
 void USBMgr::cameraStarted()
 {
+	std::lock_guard<std::mutex> lock(thread_control_mutex);
 	if (active_camera_count++ == 0)
 		startTransferThread();
 }
 
 void USBMgr::cameraStopped()
 {
+	std::lock_guard<std::mutex> lock(thread_control_mutex);
 	if (--active_camera_count == 0)
 		stopTransferThread();
 }
@@ -405,53 +415,6 @@ void USBMgr::transferThreadFunc()
 	{
 		libusb_handle_events_timeout_completed(usb_context, &tv, NULL);
 	}
-}
-
-int USBMgr::listDevices( std::vector<PS3EYECam::PS3EYERef>& list )
-{
-	libusb_device *dev;
-	libusb_device **devs;
-	libusb_device_handle *devhandle;
-    int i = 0;
-    int cnt;
-
-    cnt = (int)libusb_get_device_list(usb_context, &devs);
-
-	if (cnt < 0) {
-		debug("Error Device scan\n");
-	}
-
-    cnt = 0;
-    while ((dev = devs[i++]) != NULL) 
-	{
-		struct libusb_device_descriptor desc;
-		libusb_get_device_descriptor(dev, &desc);
-		if (desc.idVendor == PS3EYECam::VENDOR_ID && desc.idProduct == PS3EYECam::PRODUCT_ID)
-		{
-			int err = libusb_open(dev, &devhandle);
-			if (err == 0)
-			{
-				libusb_close(devhandle);
-				list.push_back( PS3EYECam::PS3EYERef( new PS3EYECam(dev) ) );
-				libusb_ref_device(dev);
-				cnt++;
-			}
-		}
-	}
-
-	libusb_free_device_list(devs, 1);
-
-    return cnt;
-}
-
-void micStarted()
-{
-	USBMgr::instance()->cameraStarted();
-}
-
-void micStopped()
-{
-	USBMgr::instance()->cameraStopped();
 }
 
 static void LIBUSB_CALL transfer_completed_callback(struct libusb_transfer *xfr);
@@ -556,6 +519,10 @@ public:
 		else if (outputFormat == PS3EYECam::EOutputFormat::Gray)
 		{
 			DebayerGray(frame_width, frame_height, source, new_frame);
+		}
+		else if (outputFormat == PS3EYECam::EOutputFormat::YUY2)
+		{
+			DebayerYUY2(frame_width, frame_height, source, new_frame, flip_v);
 		}
 		// Update tail and available count
 		tail = (tail + 1) % num_frames;
@@ -777,7 +744,131 @@ public:
 		}
 	}
 
+	// PS3EyeVCam patch: fused single-pass Bayer (GRBG) -> YUY2 debayer.
+	//
+	// Replaces the old Bayer -> BGRA -> YUY2 double conversion: each output
+	// row is debayered into a small cache-resident RGB row scratch (same
+	// neighborhood math and edge replication as DebayerRGB) and immediately
+	// packed to YUY2 with BT.601 limited-range coefficients, chroma averaged
+	// per horizontal pixel pair. No full-frame intermediate exists.
+	void DebayerYUY2(int frame_width, int frame_height, const uint8_t* inBayer, uint8_t* outBuffer, bool flip_v)
+	{
+		const int source_stride = frame_width;
+		const int out_stride    = frame_width * 2;
+		const uint8_t* source_row = inBayer;
+
+		// Rows 1..height-2 are computed; rows 0 and height-1 are copied from
+		// their neighbours afterwards (replicating in YUY2 space equals
+		// replicating in RGB space).
+		for (int y = 0; y < frame_height - 2; source_row += source_stride, ++y)
+		{
+			const bool greenFirst = (y % 2) == (int)flip_v;
+			DebayerRowRGB(source_row, frame_width, greenFirst, rgb_row_scratch);
+			RgbRowToYuy2(rgb_row_scratch, outBuffer + (size_t)(y + 1) * out_stride, frame_width);
+		}
+
+		memcpy(outBuffer, outBuffer + out_stride, out_stride);
+		memcpy(outBuffer + (size_t)(frame_height - 1) * out_stride,
+		       outBuffer + (size_t)(frame_height - 2) * out_stride, out_stride);
+	}
+
 private:
+	// Debayers one output row into RGB triplets (R,G,B per pixel). source_row
+	// points at the bayer row ABOVE the output row, exactly as in DebayerRGB;
+	// greenFirst selects the row phase. Columns 0 and width-1 replicate their
+	// neighbours, matching DebayerRGB's edge handling byte for byte.
+	static void DebayerRowRGB(const uint8_t* source_row, int frame_width, bool greenFirst, uint8_t* rgb)
+	{
+		const int source_stride   = frame_width;
+		const uint8_t* source     = source_row;
+		const uint8_t* source_end = source + (source_stride - 2);
+		uint8_t* dest             = rgb + 3;	// column 0 is filled by replication below
+
+		if (greenFirst)
+		{
+			// First computed pixel (green site)
+			dest[0] = (source[1] + source[source_stride * 2 + 1] + 1) >> 1;
+			dest[1] = source[source_stride + 1];
+			dest[2] = (source[source_stride] + source[source_stride + 2] + 1) >> 1;
+
+			source++;
+			dest += 3;
+
+			for (; source <= source_end - 2; source += 2, dest += 6)
+			{
+				// Blue pixel
+				dest[0] = (source[0] + source[2] + source[source_stride * 2] + source[source_stride * 2 + 2] + 2) >> 2;
+				dest[1] = (source[1] + source[source_stride] + source[source_stride + 2] + source[source_stride * 2 + 1] + 2) >> 2;
+				dest[2] = source[source_stride + 1];
+
+				// Green pixel
+				dest[3] = (source[2] + source[source_stride * 2 + 2] + 1) >> 1;
+				dest[4] = source[source_stride + 2];
+				dest[5] = (source[source_stride + 1] + source[source_stride + 3] + 1) >> 1;
+			}
+		}
+		else
+		{
+			for (; source <= source_end - 2; source += 2, dest += 6)
+			{
+				// Red pixel
+				dest[0] = source[source_stride + 1];
+				dest[1] = (source[1] + source[source_stride] + source[source_stride + 2] + source[source_stride * 2 + 1] + 2) >> 2;
+				dest[2] = (source[0] + source[2] + source[source_stride * 2] + source[source_stride * 2 + 2] + 2) >> 2;
+
+				// Green pixel
+				dest[3] = (source[source_stride + 1] + source[source_stride + 3] + 1) >> 1;
+				dest[4] = source[source_stride + 2];
+				dest[5] = (source[2] + source[source_stride * 2 + 2] + 1) >> 1;
+			}
+		}
+
+		// Trailing single pixel (only reached on green-first rows for even
+		// widths; blue-site math, as in DebayerRGB's shared tail block).
+		if (source < source_end)
+		{
+			dest[0] = (source[0] + source[2] + source[source_stride * 2] + source[source_stride * 2 + 2] + 2) >> 2;
+			dest[1] = (source[1] + source[source_stride] + source[source_stride + 2] + source[source_stride * 2 + 1] + 2) >> 2;
+			dest[2] = source[source_stride + 1];
+			source++;
+			dest += 3;
+		}
+
+		// Replicate edge pixels.
+		rgb[0] = rgb[3];
+		rgb[1] = rgb[4];
+		rgb[2] = rgb[5];
+		uint8_t* last = rgb + (size_t)(frame_width - 1) * 3;
+		last[0] = last[-3];
+		last[1] = last[-2];
+		last[2] = last[-1];
+	}
+
+	// Packs one RGB row to YUY2 (BT.601 limited range). Luma is computed per
+	// pixel; chroma from the average of each horizontal pixel pair -- the
+	// same math the host previously applied to the BGRA intermediate, so the
+	// colorimetry on the FrameBus is unchanged.
+	static void RgbRowToYuy2(const uint8_t* rgb, uint8_t* out, int frame_width)
+	{
+		for (int x = 0; x < frame_width; x += 2)
+		{
+			const int r0 = rgb[0], g0 = rgb[1], b0 = rgb[2];
+			const int r1 = rgb[3], g1 = rgb[4], b1 = rgb[5];
+			const int r = (r0 + r1 + 1) >> 1, g = (g0 + g1 + 1) >> 1, b = (b0 + b1 + 1) >> 1;
+
+			out[0] = (uint8_t)(((66 * r0 + 129 * g0 + 25 * b0 + 128) >> 8) + 16);
+			out[1] = (uint8_t)(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
+			out[2] = (uint8_t)(((66 * r1 + 129 * g1 + 25 * b1 + 128) >> 8) + 16);
+			out[3] = (uint8_t)(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
+
+			rgb += 6;
+			out += 4;
+		}
+	}
+
+	// One debayered RGB row (max sensor width); reused across rows and frames.
+	uint8_t					rgb_row_scratch[640 * 3];
+
 	uint32_t				frame_size;
 	uint32_t				num_frames;
 
@@ -847,9 +938,21 @@ public:
 			xfr[index] = libusb_alloc_transfer(0);
 			libusb_fill_bulk_transfer(xfr[index], handle, bulk_endpoint, transfer_buffer + index * TRANSFER_SIZE, TRANSFER_SIZE, transfer_completed_callback, reinterpret_cast<void*>(this), 0);
 
-			res |= libusb_submit_transfer(xfr[index]);
-			
-			num_active_transfers++;
+			const int submit_res = libusb_submit_transfer(xfr[index]);
+			if (submit_res == 0)
+			{
+				// PS3EyeVCam patch: only submitted transfers are counted --
+				// a transfer that never made it in flight gets no callback,
+				// and counting it would make close_transfers wait forever.
+				std::lock_guard<std::mutex> lock(num_active_transfers_mutex);
+				++num_active_transfers;
+			}
+			else
+			{
+				libusb_free_transfer(xfr[index]);
+				xfr[index] = nullptr;
+				res |= submit_res;
+			}
 		}
 
 		last_pts = 0;
@@ -867,26 +970,42 @@ public:
 		if (frame_queue != NULL)
 			frame_queue->Abort();
 
-		std::unique_lock<std::mutex> lock(num_active_transfers_mutex);
-		if (num_active_transfers == 0)
+		// PS3EyeVCam patch: transfer_buffer doubles as the "transfers were
+		// started" flag. This function is the single owner of teardown and
+		// must run exactly once per streaming session -- even when every
+		// transfer has already retired itself (device unplug drives the
+		// active count to 0 before anyone calls us). The old early-return on
+		// a zero count leaked the buffer and the libusb transfers, and left
+		// the event thread running.
+		if (transfer_buffer == NULL)
 			return;
 
-		// Cancel any pending transfers
-		for (int index = 0; index < NUM_TRANSFERS; ++index)
 		{
-			libusb_cancel_transfer(xfr[index]);
+			std::unique_lock<std::mutex> lock(num_active_transfers_mutex);
+
+			// Cancel transfers still in flight; cancelling one that already
+			// completed or errored is a harmless no-op error.
+			for (int index = 0; index < NUM_TRANSFERS; ++index)
+			{
+				if (xfr[index] != nullptr)
+					libusb_cancel_transfer(xfr[index]);
+			}
+
+			// Wait for the cancellation callbacks (libusb event thread).
+			num_active_transfers_condition.wait(lock, [this]() { return num_active_transfers == 0; });
 		}
 
-		// Wait for cancelation to finish
-		num_active_transfers_condition.wait(lock, [this]() { return num_active_transfers == 0; });
-
-		// Free completed transfers
+		// No callback can reference these anymore: every submitted transfer
+		// has retired and nothing can resubmit.
 		for (int index = 0; index < NUM_TRANSFERS; ++index)
 		{
-			libusb_free_transfer(xfr[index]);
-			xfr[index] = nullptr;
+			if (xfr[index] != nullptr)
+			{
+				libusb_free_transfer(xfr[index]);
+				xfr[index] = nullptr;
+			}
 		}
-		
+
 		USBMgr::instance()->cameraStopped();
 
 		free(transfer_buffer);
@@ -895,11 +1014,21 @@ public:
 		// ~URBDesc / start_transfers.
 	}
 
-	void transfer_canceled()
+	// PS3EyeVCam patch: called from the libusb event thread whenever a
+	// transfer permanently leaves flight (cancelled, device error, or
+	// resubmit failure). Only bookkeeping happens here -- teardown is owned
+	// by close_transfers on the controller thread.
+	void transfer_retired()
 	{
-		std::lock_guard<std::mutex> lock(num_active_transfers_mutex);
-		--num_active_transfers;
+		{
+			std::lock_guard<std::mutex> lock(num_active_transfers_mutex);
+			--num_active_transfers;
+		}
 		num_active_transfers_condition.notify_one();
+		// Streaming is ending (or broken): fail a consumer blocked in
+		// Dequeue immediately instead of letting it ride out its timeout.
+		if (frame_queue != NULL)
+			frame_queue->Abort();
 	}
 
 	void frame_add(enum gspca_packet_type packet_type, const uint8_t *data, int len)
@@ -1042,27 +1171,29 @@ static void LIBUSB_CALL transfer_completed_callback(struct libusb_transfer *xfr)
     URBDesc *urb = reinterpret_cast<URBDesc*>(xfr->user_data);
     enum libusb_transfer_status status = xfr->status;
 
-    if (status != LIBUSB_TRANSFER_COMPLETED) 
+    if (status == LIBUSB_TRANSFER_COMPLETED)
+    {
+        //debug("length:%u, actual_length:%u\n", xfr->length, xfr->actual_length);
+        urb->pkt_scan(xfr->buffer, xfr->actual_length);
+
+        if (libusb_submit_transfer(xfr) == 0)
+            return;
+        debug("error re-submitting URB\n");
+    }
+    else
     {
         debug("transfer status %d\n", status);
-        
-		urb->transfer_canceled();
-        
-        if(status != LIBUSB_TRANSFER_CANCELLED)
-        {
-            urb->close_transfers();
-        }
-        return;
     }
 
-    //debug("length:%u, actual_length:%u\n", xfr->length, xfr->actual_length);
-
-    urb->pkt_scan(xfr->buffer, xfr->actual_length);
-
-    if (libusb_submit_transfer(xfr) < 0) {
-        debug("error re-submitting URB\n");
-        urb->close_transfers();
-    }
+    // PS3EyeVCam patch: the transfer is permanently out of flight (cancelled,
+    // device error, or resubmit failure). NEVER call close_transfers() from
+    // here: it blocks until the remaining transfers retire, but their
+    // callbacks can only run on this very event thread -- on device unplug
+    // that deadlocked the event thread and then every thread that touched
+    // the camera. Retiring the transfer (and aborting the frame queue) is
+    // enough: the capture thread sees frames stop, times out, and runs the
+    // real teardown via PS3EYECam::stop().
+    urb->transfer_retired();
 }
 
 template<>
@@ -1076,14 +1207,157 @@ inline void FrameQueue::setAlpha<4>(uint8_t *destGreen) { destGreen[2] = 255; }
 bool PS3EYECam::devicesEnumerated = false;
 std::vector<PS3EYECam::PS3EYERef> PS3EYECam::devices;
 
+#define MAX_USB_DEVICE_PORT_PATH 7
+
+// Builds the stable physical identifier "b<bus>_p<port>[.<port>...]" for a
+// device. Works on libusb's cached topology data, so it stays valid even for
+// devices that have already been unplugged (as long as a reference is held).
+// Single source of truth -- also used by PS3EYECam::getUSBPortPath.
+static bool GetDevicePortPath(libusb_device* device, char* out_identifier, size_t max_identifier_length)
+{
+    uint8_t port_numbers[MAX_USB_DEVICE_PORT_PATH];
+    memset(out_identifier, 0, max_identifier_length);
+    memset(port_numbers, 0, sizeof(port_numbers));
+    const int port_count = libusb_get_port_numbers(device, port_numbers, MAX_USB_DEVICE_PORT_PATH);
+    if (port_count <= 0)
+        return false;
+    const int bus_id = libusb_get_bus_number(device);
+    int written = snprintf(out_identifier, max_identifier_length, "b%d", bus_id);
+    if (written < 0 || (size_t)written >= max_identifier_length)
+        return false;
+    for (int port_index = 0; port_index < port_count; ++port_index)
+    {
+        char port_string[8];
+        snprintf(port_string, sizeof(port_string), (port_index == 0) ? "_p%d" : ".%d", port_numbers[port_index]);
+        port_string[sizeof(port_string) - 1] = '\0';
+        if (strlen(out_identifier) + strlen(port_string) + 1 > max_identifier_length)
+            return false;
+        std::strcat(out_identifier, port_string);
+    }
+    return true;
+}
+
+// Probe-open the device (catches a missing WinUSB driver or an access
+// problem) and on success bind it to the slot. The PS3EYECam constructor
+// takes its own libusb reference (released by the destructor).
+static bool TryAdoptDevice(PS3EYECam::PS3EYERef& slot, libusb_device* dev)
+{
+    libusb_device_handle* devhandle = nullptr;
+    if (libusb_open(dev, &devhandle) != 0)
+        return false;
+    libusb_close(devhandle);
+    slot = PS3EYECam::PS3EYERef(new PS3EYECam(dev));
+    return true;
+}
+
+// Stable slot mapping: each physical camera keeps its index (0..7) across
+// refreshes, unplugs, and replugs. NOT internally synchronized -- every
+// caller (host capture threads) serializes through g_devicesLock.
 const std::vector<PS3EYECam::PS3EYERef>& PS3EYECam::getDevices( bool forceRefresh )
 {
+    constexpr int kDeviceSlotCount = 8;
+
     if( devicesEnumerated && ( ! forceRefresh ) )
         return devices;
 
-    devices.clear();
+    if (devices.size() != kDeviceSlotCount)
+        devices.resize(kDeviceSlotCount, nullptr);
 
-    USBMgr::instance()->sTotalDevices = USBMgr::instance()->listDevices(devices);
+    libusb_device **devs = nullptr;
+    const int cnt = (int)libusb_get_device_list(USBMgr::instance()->getContext(), &devs);
+
+    // Currently connected PS3 Eye devices with a usable port path.
+    struct Candidate
+    {
+        libusb_device* dev;
+        std::string    path;
+        bool           claimed;
+    };
+    std::vector<Candidate> candidates;
+    if (cnt > 0 && devs != nullptr)
+    {
+        for (int i = 0; devs[i] != nullptr; ++i)
+        {
+            struct libusb_device_descriptor desc;
+            if (libusb_get_device_descriptor(devs[i], &desc) != 0)
+                continue;
+            if (desc.idVendor != VENDOR_ID || desc.idProduct != PRODUCT_ID)
+                continue;
+            char path[128];
+            if (GetDevicePortPath(devs[i], path, sizeof(path)))
+                candidates.push_back(Candidate{ devs[i], path, false });
+        }
+    }
+
+    // Phase 1 -- keep slots whose exact libusb_device object is still
+    // connected. libusb hands out the same device object for a connection
+    // that stayed plugged in, so pointer identity distinguishes "still here"
+    // from "unplugged and replugged into the same port": a replug produces a
+    // NEW libusb_device, and the old one can never be opened again. Matching
+    // by port path alone kept the stale object forever and permanently broke
+    // the slot until the host was restarted.
+    std::vector<std::string> vacatedPaths(kDeviceSlotCount);
+    for (int i = 0; i < kDeviceSlotCount; ++i)
+    {
+        if (!devices[i])
+            continue;
+        bool stillPresent = false;
+        for (auto& c : candidates)
+        {
+            if (!c.claimed && c.dev == devices[i]->getDevice())
+            {
+                c.claimed = true;
+                stillPresent = true;
+                break;
+            }
+        }
+        if (!stillPresent)
+        {
+            // Remember the port path so a replugged camera prefers its old
+            // slot. A capture thread may still hold a reference to the
+            // dropped object; it tears down independently once frames stop.
+            char path[128];
+            if (devices[i]->getUSBPortPath(path, sizeof(path)))
+                vacatedPaths[i] = path;
+            devices[i] = nullptr;
+        }
+    }
+
+    // Phase 2a -- a new device whose port path matches a just-vacated slot is
+    // a replug: give it its old index back.
+    for (auto& c : candidates)
+    {
+        if (c.claimed)
+            continue;
+        for (int i = 0; i < kDeviceSlotCount; ++i)
+        {
+            if (!devices[i] && !vacatedPaths[i].empty() && vacatedPaths[i] == c.path)
+            {
+                if (TryAdoptDevice(devices[i], c.dev))
+                    c.claimed = true;
+                break;
+            }
+        }
+    }
+
+    // Phase 2b -- everything else goes into the first empty slot.
+    for (auto& c : candidates)
+    {
+        if (c.claimed)
+            continue;
+        for (int i = 0; i < kDeviceSlotCount; ++i)
+        {
+            if (!devices[i])
+            {
+                if (TryAdoptDevice(devices[i], c.dev))
+                    c.claimed = true;
+                break;
+            }
+        }
+    }
+
+    if (devs != nullptr)
+        libusb_free_device_list(devs, 1);
 
     devicesEnumerated = true;
     return devices;
@@ -1095,11 +1369,7 @@ PS3EYECam::PS3EYECam(libusb_device *device)
 	autogain = false;
 	gain = 20;
 	exposure = 120;
-	sharpness = 0;
-	hue = 143;
 	awb = false;
-	brightness = 20;
-	contrast =  37;
 	blueblc = 128;
 	redblc = 128;
 	greenblc = 128;
@@ -1111,7 +1381,10 @@ PS3EYECam::PS3EYECam(libusb_device *device)
 
 	is_streaming = false;
 
-	device_ = device;
+	// PS3EyeVCam patch: the constructor owns the libusb reference (the
+	// destructor releases it) -- symmetric RAII instead of relying on the
+	// caller to ref after construction.
+	device_ = libusb_ref_device(device);
 	mgrPtr = USBMgr::instance();
 	urb = std::shared_ptr<URBDesc>( new URBDesc() );
 }
@@ -1120,13 +1393,20 @@ PS3EYECam::~PS3EYECam()
 {
 	stop();
 	release();
+	if (device_ != nullptr) {
+		libusb_unref_device(device_);
+		device_ = nullptr;
+	}
 }
 
 void PS3EYECam::release()
 {
 	if(handle_ != NULL) 
 		close_usb();
-	if(usb_buf) free(usb_buf);
+	if(usb_buf) {
+		free(usb_buf);
+		usb_buf = nullptr;
+	}
 }
 
 bool PS3EYECam::init(uint32_t width, uint32_t height, uint16_t desiredFrameRate, EOutputFormat outputFormat)
@@ -1197,10 +1477,10 @@ bool PS3EYECam::init(uint32_t width, uint32_t height, uint16_t desiredFrameRate,
 	return true;
 }
 
-void PS3EYECam::start()
+bool PS3EYECam::start()
 {
-    if(is_streaming) return;
-    
+    if(is_streaming) return true;
+
 	if (frame_width == 320) {	/* 320x240 */
 		reg_w_array(bridge_start_qvga, ARRAY_SIZE(bridge_start_qvga));
 		sccb_w_array(sensor_start_qvga, ARRAY_SIZE(sensor_start_qvga));
@@ -1214,11 +1494,7 @@ void PS3EYECam::start()
 	setAutogain(autogain);
 	setAutoWhiteBalance(awb);
 	setGain(gain);
-	setHue(hue);
 	setExposure(exposure);
-	setBrightness(brightness);
-	setContrast(contrast);
-	setSharpness(sharpness);
 	setRedBalance(redblc);
 	setBlueBalance(blueblc);
 	setGreenBalance(greenblc);
@@ -1228,8 +1504,18 @@ void PS3EYECam::start()
 	ov534_reg_write(0xe0, 0x00); // start stream
 
 	// init and start urb
-	urb->start_transfers(handle_, frame_width*frame_height);
+	// PS3EyeVCam patch: a failed submission used to be ignored, leaving the
+	// object claiming to stream with zero transfers in flight. Tear down
+	// whatever was partially submitted and report the failure instead.
+	if (!urb->start_transfers(handle_, frame_width*frame_height))
+	{
+		urb->close_transfers();      // cancels/reaps any partial submissions
+		ov534_reg_write(0xe0, 0x09); // stop stream
+		ov534_set_led(0);
+		return false;
+	}
     is_streaming = true;
+	return true;
 }
 
 void PS3EYECam::stop()
@@ -1244,51 +1530,14 @@ void PS3EYECam::stop()
 	urb->close_transfers();
 
     is_streaming = false;
+	release();
 }
-
-#define MAX_USB_DEVICE_PORT_PATH 7
 
 bool PS3EYECam::getUSBPortPath(char *out_identifier, size_t max_identifier_length) const
 {
-    bool success = false;
-
-    if (isInitialized())
-    {
-        uint8_t port_numbers[MAX_USB_DEVICE_PORT_PATH];
-
-        memset(out_identifier, 0, max_identifier_length);
-
-        memset(port_numbers, 0, sizeof(port_numbers));
-        int port_count = libusb_get_port_numbers(device_, port_numbers, MAX_USB_DEVICE_PORT_PATH);
-        int bus_id = libusb_get_bus_number(device_);
-
-        snprintf(out_identifier, max_identifier_length, "b%d", bus_id);
-        if (port_count > 0)
-        {
-            success = true;
-
-            for (int port_index = 0; port_index < port_count; ++port_index)
-            {
-                uint8_t port_number = port_numbers[port_index];
-                char port_string[8];
-
-                snprintf(port_string, sizeof(port_string), (port_index == 0) ? "_p%d" : ".%d", port_number);
-                port_string[sizeof(port_string) - 1] = '0';
-                
-                if (strlen(out_identifier)+strlen(port_string)+1 <= max_identifier_length)
-                {
-                    std::strcat(out_identifier, port_string);
-                }
-                else
-                {
-                    success = false;
-                    break;
-                }
-            }
-        }
-    }
-
-    return success;
+    if (device_ == nullptr)
+        return false;
+    return GetDevicePortPath(device_, out_identifier, max_identifier_length);
 }
 
 uint32_t PS3EYECam::getOutputBytesPerPixel() const
@@ -1305,6 +1554,8 @@ uint32_t PS3EYECam::getOutputBytesPerPixel() const
 		return 4;
 	else if (frame_output_format == EOutputFormat::Gray)
 		return 1;
+	else if (frame_output_format == EOutputFormat::YUY2)
+		return 2;
 	return 0;
 }
 
@@ -1334,6 +1585,9 @@ bool PS3EYECam::open_usb()
 	res = libusb_claim_interface(handle_, 0);
 	if(res != 0) {
 		debug("device claim interface error: %d\n", res);
+		// PS3EyeVCam patch: don't leak the open handle on claim failure.
+		libusb_close(handle_);
+		handle_ = NULL;
 		return false;
 	}
 
@@ -1346,9 +1600,7 @@ void PS3EYECam::close_usb()
 	libusb_release_interface(handle_, 0);
 	libusb_attach_kernel_driver(handle_, 0);
 	libusb_close(handle_);
-	libusb_unref_device(device_);
 	handle_ = NULL;
-	device_ = NULL;
 	debug("device closed\n");
 }
 

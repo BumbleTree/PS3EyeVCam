@@ -47,6 +47,11 @@ struct Settings
     bool     autoWhiteBalance = true;
     uint32_t idleTimeoutMs    = 3000;
 
+    uint32_t redBalance = 128;    // 0..255  -> reg 0x02 AWB red gain (manual WB)
+    uint32_t blueBalance = 128;   // 0..255  -> reg 0x01 AWB blue gain (manual WB)
+    uint32_t greenBalance = 128;  // 0..255  -> reg 0x03 AWB green gain (manual WB)
+    bool     testPattern = false;
+
     bool SameMode(const Settings& o) const
     {
         return width == o.width && height == o.height && fps == o.fps;
@@ -55,10 +60,9 @@ struct Settings
 
 namespace settings
 {
-    inline constexpr wchar_t kRegPath[] = L"SOFTWARE\\PS3EyeVCam";
-
-    Settings Load();                    // missing values -> struct defaults
-    bool     Save(const Settings& s);   // full write
-    void     SeedDefaults();            // write only values not yet present
+    Settings Defaults();                                   // factory defaults for one camera
+    Settings Load(int cameraIndex = 0);                    // missing values -> struct defaults
+    bool     Save(int cameraIndex, const Settings& s);   // full write
+    void     SeedDefaults(int cameraIndex = 0);            // write only values not yet present
     int      FindModeIndex(uint32_t w, uint32_t h, uint32_t fps);  // -1 if unknown
 }

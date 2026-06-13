@@ -14,14 +14,14 @@ public:
 
     static constexpr wchar_t kWindowClass[] = L"PS3EyeVCamTrayWnd";
 
-    bool Create(HINSTANCE instance, CaptureController* controller);
+    bool Create(HINSTANCE instance, CaptureController* controllers);
     void Destroy();
     HWND Hwnd() const { return _hwnd; }
 
     // Apply a settings snapshot to the controller and persist it; shows the
     // "mode change deferred" balloon when applicable. Used by both the menu
     // and the settings dialog.
-    void ApplySettings(const Settings& s, bool persistNow);
+    void ApplySettings(int cameraIndex, const Settings& s, bool persistNow);
 
 private:
     static LRESULT CALLBACK WndProcThunk(HWND, UINT, WPARAM, LPARAM);
@@ -37,9 +37,9 @@ private:
     HINSTANCE          _instance = nullptr;
     HWND               _hwnd = nullptr;
     HICON              _icon = nullptr;
+    CaptureController* _controllers = nullptr;
     CaptureController* _controller = nullptr;
     UINT               _taskbarCreatedMsg = 0;
     bool               _iconAdded = false;
-    Settings           _pendingSave{};
-    bool               _saveQueued = false;
+    HDEVNOTIFY         _devNotify = nullptr;  // PS3 Eye interface arrival/removal
 };

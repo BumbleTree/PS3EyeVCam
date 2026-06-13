@@ -16,6 +16,15 @@
 #define IDC_AUTOSTART       209
 #define IDC_STATUS_TEXT     210
 #define IDC_AWB             211
+#define IDC_CAMCOMBO          212
+#define IDC_RED_SLIDER        221
+#define IDC_RED_LABEL         222
+#define IDC_BLUE_SLIDER       223
+#define IDC_BLUE_LABEL        224
+#define IDC_GREEN_SLIDER      225
+#define IDC_GREEN_LABEL       226
+#define IDC_TESTPATTERN       227
+#define IDC_RESET             229
 
 // Tray menu commands (menu built dynamically)
 #define IDM_SETTINGS        300

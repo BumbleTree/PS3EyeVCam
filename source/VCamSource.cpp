@@ -21,7 +21,7 @@ void VCamTrace(const wchar_t* fmt, ...)
 // MediaStream
 // ===========================================================================
 
-MediaStream::MediaStream(MediaSource* parent) : _parent(parent)
+MediaStream::MediaStream(MediaSource* parent, int cameraIndex) : _parent(parent), _cameraIndex(cameraIndex)
 {
     DllAddRef();
 }
@@ -29,109 +29,170 @@ MediaStream::MediaStream(MediaSource* parent) : _parent(parent)
 namespace
 {
 
-void UpscaleNv12_2x(const uint8_t* src, uint8_t* dst, uint32_t srcW, uint32_t srcH)
+// ---- SWAR helpers (x64 little-endian) -------------------------------------
+
+inline uint64_t Load64(const uint8_t* p)
 {
-    const uint8_t* srcY = src;
-    const uint8_t* srcUV = src + srcW * srcH;
-    
-    uint8_t* dstY = dst;
-    uint8_t* dstUV = dst + srcW * 2 * srcH * 2;
-    
-    // 1. Upscale Y plane (320x240 -> 640x480)
+    uint64_t v;
+    memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+inline void Store64(uint8_t* p, uint64_t v)
+{
+    memcpy(p, &v, sizeof(v));
+}
+
+// Rounding-up byte-wise average of 8 byte lanes: per byte, (a + b + 1) >> 1.
+// Identity: avg_up(a,b) = (a | b) - (((a ^ b) >> 1) & 0x7f per lane).
+inline uint64_t AvgBytes8(uint64_t a, uint64_t b)
+{
+    return (a | b) - (((a ^ b) >> 1) & 0x7f7f7f7f7f7f7f7full);
+}
+
+// Bilinear 2x upscale in the YUY2 domain (e.g. 320x240 -> 640x480).
+//
+// Pass 1 writes every even output row: luma and chroma are doubled with the
+// in-between samples linearly interpolated from their horizontal neighbours
+// (edge samples replicate). Pass 2 fills the odd rows as the byte-wise mean
+// of the two adjacent even rows — in YUY2 every byte column holds the same
+// component on every row, so a byte-wise average IS a true vertical lerp.
+void UpscaleYuy2_2x(const uint8_t* src, uint8_t* dst, uint32_t srcW, uint32_t srcH)
+{
+    const uint32_t srcStride = srcW * 2;
+    const uint32_t dstStride = srcW * 4;        // (srcW * 2 px) * 2 bytes
+    const uint32_t srcPairs  = srcW / 2;        // YUYV macropixels per row
+
     for (uint32_t y = 0; y < srcH; ++y)
     {
-        const uint8_t* srcRow = srcY + y * srcW;
-        uint8_t* dstRow0 = dstY + (y * 2) * (srcW * 2);
-        uint8_t* dstRow1 = dstRow0 + (srcW * 2);
-        
-        for (uint32_t x = 0; x < srcW; ++x)
+        const uint8_t* s = src + y * srcStride;
+        uint8_t* d = dst + (y * 2) * dstStride;
+
+        for (uint32_t i = 0; i < srcPairs; ++i)
         {
-            uint8_t val = srcRow[x];
-            dstRow0[x * 2]     = val;
-            dstRow0[x * 2 + 1] = val;
-            dstRow1[x * 2]     = val;
-            dstRow1[x * 2 + 1] = val;
+            const uint32_t y0 = s[i * 4 + 0], u0 = s[i * 4 + 1];
+            const uint32_t y1 = s[i * 4 + 2], v0 = s[i * 4 + 3];
+            const bool last = (i + 1 == srcPairs);
+            const uint32_t y2 = last ? y1 : s[i * 4 + 4];
+            const uint32_t u1 = last ? u0 : s[i * 4 + 5];
+            const uint32_t v1 = last ? v0 : s[i * 4 + 7];
+
+            uint8_t* o = d + i * 8;
+            o[0] = static_cast<uint8_t>(y0);
+            o[1] = static_cast<uint8_t>(u0);
+            o[2] = static_cast<uint8_t>((y0 + y1 + 1) >> 1);
+            o[3] = static_cast<uint8_t>(v0);
+            o[4] = static_cast<uint8_t>(y1);
+            o[5] = static_cast<uint8_t>((u0 + u1 + 1) >> 1);
+            o[6] = static_cast<uint8_t>((y1 + y2 + 1) >> 1);
+            o[7] = static_cast<uint8_t>((v0 + v1 + 1) >> 1);
         }
     }
-    
-    // 2. Upscale UV plane (320x120 -> 640x240)
+
+    // In YUY2 every byte column holds the same component on every row, so a
+    // byte-wise average IS a true vertical lerp; do it 8 bytes per op.
+    for (uint32_t y = 0; y + 1 < srcH; ++y)
+    {
+        const uint8_t* a = dst + (y * 2) * dstStride;
+        const uint8_t* b = a + 2 * dstStride;
+        uint8_t* o = dst + (y * 2 + 1) * dstStride;
+        uint32_t x = 0;
+        for (; x + 8 <= dstStride; x += 8)
+            Store64(o + x, AvgBytes8(Load64(a + x), Load64(b + x)));
+        for (; x < dstStride; ++x)
+            o[x] = static_cast<uint8_t>((a[x] + b[x] + 1) >> 1);
+    }
+    memcpy(dst + (srcH * 2 - 1) * dstStride, dst + (srcH * 2 - 2) * dstStride, dstStride);
+}
+
+// 2x2 box-filter downscale in the YUY2 domain (e.g. 640x480 -> 320x240).
+// Every output sample is the mean of the four source samples it covers,
+// which avoids the aliasing of point sampling.
+void DownscaleYuy2_2x(const uint8_t* src, uint8_t* dst, uint32_t srcW, uint32_t srcH)
+{
+    const uint32_t srcStride = srcW * 2;
+    const uint32_t dstStride = srcW;            // (srcW / 2 px) * 2 bytes
+    const uint32_t dstPairs  = srcW / 4;        // output macropixels per row
+
     for (uint32_t y = 0; y < srcH / 2; ++y)
     {
-        const uint8_t* srcRowUV = srcUV + y * srcW;
-        uint8_t* dstRowUV0 = dstUV + (y * 2) * (srcW * 2);
-        uint8_t* dstRowUV1 = dstRowUV0 + (srcW * 2);
-        
-        for (uint32_t x = 0; x < srcW / 2; ++x)
+        const uint8_t* r0 = src + (y * 2) * srcStride;
+        const uint8_t* r1 = r0 + srcStride;
+        uint8_t* d = dst + y * dstStride;
+
+        for (uint32_t i = 0; i < dstPairs; ++i)
         {
-            uint8_t u = srcRowUV[x * 2];
-            uint8_t v = srcRowUV[x * 2 + 1];
-            
-            dstRowUV0[x * 4]     = u;
-            dstRowUV0[x * 4 + 1] = v;
-            dstRowUV0[x * 4 + 2] = u;
-            dstRowUV0[x * 4 + 3] = v;
-            
-            dstRowUV1[x * 4]     = u;
-            dstRowUV1[x * 4 + 1] = v;
-            dstRowUV1[x * 4 + 2] = u;
-            dstRowUV1[x * 4 + 3] = v;
+            const uint8_t* s0 = r0 + i * 8;     // two source macropixels...
+            const uint8_t* s1 = r1 + i * 8;     // ...on each of two rows
+            uint8_t* o = d + i * 4;
+            o[0] = static_cast<uint8_t>((s0[0] + s0[2] + s1[0] + s1[2] + 2) >> 2);  // Y
+            o[1] = static_cast<uint8_t>((s0[1] + s0[5] + s1[1] + s1[5] + 2) >> 2);  // U
+            o[2] = static_cast<uint8_t>((s0[4] + s0[6] + s1[4] + s1[6] + 2) >> 2);  // Y
+            o[3] = static_cast<uint8_t>((s0[3] + s0[7] + s1[3] + s1[7] + 2) >> 2);  // V
         }
     }
 }
 
-void DownscaleNv12_2x(const uint8_t* src, uint8_t* dst, uint32_t srcW, uint32_t srcH)
+void FillYuy2Black(uint8_t* dst, uint32_t w, uint32_t h)
 {
-    const uint8_t* srcY = src;
-    const uint8_t* srcUV = src + srcW * srcH;
-    
-    uint8_t* dstY = dst;
-    uint8_t* dstUV = dst + (srcW / 2) * (srcH / 2);
-    
-    // 1. Downscale Y plane (640x480 -> 320x240)
-    for (uint32_t y = 0; y < srcH / 2; ++y)
-    {
-        const uint8_t* srcRow = srcY + (y * 2) * srcW;
-        uint8_t* dstRow = dstY + y * (srcW / 2);
-        
-        for (uint32_t x = 0; x < srcW / 2; ++x)
-        {
-            dstRow[x] = srcRow[x * 2];
-        }
-    }
-    
-    // 2. Downscale UV plane (640x240 -> 320x120)
-    for (uint32_t y = 0; y < srcH / 4; ++y)
-    {
-        const uint8_t* srcRowUV = srcUV + (y * 2) * srcW;
-        uint8_t* dstRowUV = dstUV + y * (srcW / 2);
-        
-        for (uint32_t x = 0; x < srcW / 4; ++x)
-        {
-            dstRowUV[x * 2]     = srcRowUV[x * 4];
-            dstRowUV[x * 2 + 1] = srcRowUV[x * 4 + 1];
-        }
-    }
+    // YUY2 black: Y 0x10, U/V 0x80, repeating byte pattern Y U Y V.
+    uint32_t* p = reinterpret_cast<uint32_t*>(dst);
+    const size_t words = static_cast<size_t>(w) * h / 2;  // 4 bytes per 2 px
+    for (size_t i = 0; i < words; ++i)
+        p[i] = 0x80108010u;
 }
 
-void Nv12ToYuy2(const uint8_t* src, uint8_t* dst, uint32_t w, uint32_t h)
+// YUY2 (4:2:2) -> NV12 (4:2:0). Luma is copied; each output chroma sample is
+// the mean of the two source rows it replaces — the correct 4:2:0 downsample.
+//
+// Inner loop works on 8 source bytes per row (4 pixels / 2 macropixels): one
+// SWAR average yields both rows' chroma means at once (lumas in the averaged
+// word are simply ignored), and the lumas are picked out of the loaded words.
+void Yuy2ToNv12(const uint8_t* src, uint8_t* dst, uint32_t w, uint32_t h)
 {
-    const uint8_t* srcY = src;
-    const uint8_t* srcUV = src + w * h;
-    
-    for (uint32_t y = 0; y < h; ++y)
+    const uint32_t srcStride = w * 2;
+    uint8_t* dstY  = dst;
+    uint8_t* dstUV = dst + static_cast<size_t>(w) * h;
+
+    for (uint32_t y = 0; y < h; y += 2)
     {
-        const uint8_t* rowY = srcY + y * w;
-        const uint8_t* rowUV = srcUV + (y / 2) * w;
-        uint32_t* rowDst = reinterpret_cast<uint32_t*>(dst + y * w * 2);
-        
-        for (uint32_t x = 0; x < w; x += 2)
+        const uint8_t* p0 = src + y * srcStride;
+        const uint8_t* p1 = p0 + srcStride;
+        uint8_t* y0 = dstY + y * w;
+        uint8_t* y1 = y0 + w;
+        uint8_t* uv = dstUV + (y / 2) * w;
+
+        uint32_t x = 0;
+        for (; x + 4 <= w; x += 4)
         {
-            uint32_t y0 = rowY[x];
-            uint32_t y1 = rowY[x + 1];
-            uint32_t u  = rowUV[x];
-            uint32_t v  = rowUV[x + 1];
-            
-            rowDst[x / 2] = y0 | (u << 8) | (y1 << 16) | (v << 24);
+            const uint64_t a   = Load64(p0);   // Y0 U0 Y1 V0 Y2 U1 Y3 V1
+            const uint64_t b   = Load64(p1);
+            const uint64_t avg = AvgBytes8(a, b);
+
+            y0[0] = static_cast<uint8_t>(a);
+            y0[1] = static_cast<uint8_t>(a >> 16);
+            y0[2] = static_cast<uint8_t>(a >> 32);
+            y0[3] = static_cast<uint8_t>(a >> 48);
+            y1[0] = static_cast<uint8_t>(b);
+            y1[1] = static_cast<uint8_t>(b >> 16);
+            y1[2] = static_cast<uint8_t>(b >> 32);
+            y1[3] = static_cast<uint8_t>(b >> 48);
+            uv[0] = static_cast<uint8_t>(avg >> 8);   // U
+            uv[1] = static_cast<uint8_t>(avg >> 24);  // V
+            uv[2] = static_cast<uint8_t>(avg >> 40);  // U
+            uv[3] = static_cast<uint8_t>(avg >> 56);  // V
+
+            p0 += 8; p1 += 8; y0 += 4; y1 += 4; uv += 4;
+        }
+        for (; x < w; x += 2)
+        {
+            y0[0] = p0[0];
+            y0[1] = p0[2];
+            y1[0] = p1[0];
+            y1[1] = p1[2];
+            uv[0] = static_cast<uint8_t>((p0[1] + p1[1] + 1) >> 1);
+            uv[1] = static_cast<uint8_t>((p0[3] + p1[3] + 1) >> 1);
+            p0 += 4; p1 += 4; y0 += 2; y1 += 2; uv += 2;
         }
     }
 }
@@ -146,7 +207,7 @@ HRESULT MediaStream::Initialize()
     framebus::Header fmt{};
     uint32_t defaultWidth = 640, defaultHeight = 480;
     uint32_t defaultFpsNum = 60, defaultFpsDen = 1;
-    if (_bus.TryOpen() && _bus.ReadFormat(fmt))
+    if (_bus.TryOpen(_cameraIndex) && _bus.ReadFormat(fmt))
     {
         defaultWidth = fmt.width;
         defaultHeight = fmt.height;
@@ -167,7 +228,9 @@ HRESULT MediaStream::Initialize()
     _frameBytes = framebus::Nv12Bytes(_width, _height);
     _frameDuration = MulDiv(10000000, _fpsDen, _fpsNum);
 
-    _staging.reset(new (std::nothrow) uint8_t[framebus::Nv12Bytes(_width, _height)]);
+    // _staging always holds the frame in YUY2 (the bus/native format) at the
+    // negotiated size; NV12 clients are converted at delivery time.
+    _staging.reset(new (std::nothrow) uint8_t[framebus::Yuy2Bytes(_width, _height)]);
     if (!_staging)
         return E_OUTOFMEMORY;
     FillBlack();
@@ -278,11 +341,7 @@ HRESULT MediaStream::CreateMediaType(uint32_t width, uint32_t height, uint32_t f
 
 void MediaStream::FillBlack()
 {
-    // NV12 black: luma 0x10, chroma 0x80
-    const uint32_t nv12Size = framebus::Nv12Bytes(_width, _height);
-    memset(_staging.get(), 0x10, static_cast<size_t>(_width) * _height);
-    memset(_staging.get() + static_cast<size_t>(_width) * _height, 0x80,
-           static_cast<size_t>(nv12Size) - static_cast<size_t>(_width) * _height);
+    FillYuy2Black(_staging.get(), _width, _height);
 }
 
 // Stamp the keepalive (and optionally pulse the wake event) so the host knows
@@ -296,7 +355,7 @@ void MediaStream::PingActivity(bool forceWakeSignal)
         if (now < _nextPingRetryTick)
             return;
         _nextPingRetryTick = now + 500;
-        if (!_ping.TryOpen())
+        if (!_ping.TryOpen(_cameraIndex))
             return;
     }
     _ping.Stamp();                          // always tick BEFORE event
@@ -312,42 +371,44 @@ HRESULT MediaStream::Start(const PROPVARIANT* startPosition)
     AutoLock lock(_lock);
     if (_shutdown)
         return MF_E_SHUTDOWN;
+
+    // Stage everything fallible BEFORE committing any live state: a stream
+    // marked RUNNING with a null staging buffer would fault inside the Frame
+    // Server on the next RequestSample.
+    uint32_t width = _width, height = _height, fpsNum = _fpsNum, fpsDen = _fpsDen;
+    GUID subtype = _subtype;
+
+    ComPtr<IMFMediaTypeHandler> handler;
+    ComPtr<IMFMediaType> currentType;
+    if (SUCCEEDED(_descriptor->GetMediaTypeHandler(&handler)) &&
+        SUCCEEDED(handler->GetCurrentMediaType(&currentType)))
+    {
+        MFGetAttributeSize(currentType.Get(), MF_MT_FRAME_SIZE, &width, &height);
+        MFGetAttributeRatio(currentType.Get(), MF_MT_FRAME_RATE, &fpsNum, &fpsDen);
+        subtype = MFVideoFormat_NV12;
+        currentType->GetGUID(MF_MT_SUBTYPE, &subtype);
+    }
+
+    std::shared_ptr<uint8_t[]> staging(new (std::nothrow) uint8_t[framebus::Yuy2Bytes(width, height)]);
+    if (!staging)
+        return E_OUTOFMEMORY;
+    FillYuy2Black(staging.get(), width, height);
+
+    _width = width;
+    _height = height;
+    _fpsNum = fpsNum;
+    _fpsDen = fpsDen;
+    _subtype = subtype;
+    _frameBytes = (subtype == MFVideoFormat_YUY2) ? framebus::Yuy2Bytes(width, height)
+                                                  : framebus::Nv12Bytes(width, height);
+    _frameDuration = MulDiv(10000000, fpsDen, fpsNum);
+    _staging = std::move(staging);
     _state = MF_STREAM_STATE_RUNNING;
     _lastFrameId = 0;  // re-sync with whatever the bus currently holds
 
-    ComPtr<IMFMediaTypeHandler> handler;
-    if (SUCCEEDED(_descriptor->GetMediaTypeHandler(&handler)))
-    {
-        ComPtr<IMFMediaType> currentType;
-        if (SUCCEEDED(handler->GetCurrentMediaType(&currentType)))
-        {
-            MFGetAttributeSize(currentType.Get(), MF_MT_FRAME_SIZE, &_width, &_height);
-            MFGetAttributeRatio(currentType.Get(), MF_MT_FRAME_RATE, &_fpsNum, &_fpsDen);
-            
-            GUID subtype = MFVideoFormat_NV12;
-            currentType->GetGUID(MF_MT_SUBTYPE, &subtype);
-            _subtype = subtype;
-
-            if (subtype == MFVideoFormat_YUY2)
-            {
-                _frameBytes = _width * _height * 2;
-            }
-            else
-            {
-                _frameBytes = framebus::Nv12Bytes(_width, _height);
-            }
-            _frameDuration = MulDiv(10000000, _fpsDen, _fpsNum);
-
-            _staging.reset(new (std::nothrow) uint8_t[framebus::Nv12Bytes(_width, _height)]);
-            if (!_staging)
-                return E_OUTOFMEMORY;
-            FillBlack();
-            VCamTrace(L"stream: start with format %ux%u @ %u/%u (subtype YUY2=%d)", _width, _height, _fpsNum, _fpsDen, (subtype == MFVideoFormat_YUY2));
-        }
-    }
-
+    VCamTrace(L"stream: started with format %ux%u @ %u/%u (subtype YUY2=%d)",
+              width, height, fpsNum, fpsDen, (subtype == MFVideoFormat_YUY2));
     PingActivity(true);
-    VCamTrace(L"stream: started");
     return _queue->QueueEventParamVar(MEStreamStarted, GUID_NULL, S_OK, startPosition);
 }
 
@@ -492,10 +553,41 @@ STDMETHODIMP MediaStream::RequestSample(IUnknown* pToken)
 
 HRESULT MediaStream::DeliverSample(IUnknown* token)
 {
-    // Pace delivery to the camera: wait (briefly) for a frame newer than the
-    // last one we handed out. On timeout we re-deliver the previous frame so
-    // the pipeline keeps flowing even if the host stalls or exits.
-    const DWORD periodMs = static_cast<DWORD>(_frameDuration / 10000);
+    // Serialize deliveries: the staging buffers below belong to exactly one
+    // in-flight DeliverSample at a time. _deliverLock is never taken by any
+    // other method, so Start/Stop/Shutdown can't block on a delivery.
+    AutoLock deliverLock(_deliverLock);
+
+    // Snapshot the negotiated format and the staging buffer under the object
+    // lock. Start() may renegotiate (swap _staging, rewrite the dimensions)
+    // concurrently; working from a consistent snapshot prevents both torn
+    // reads and a use-after-free of the buffer (the shared_ptr keeps the old
+    // buffer alive until this call finishes with it).
+    GUID     subtype;
+    uint32_t width, height, frameBytes;
+    LONGLONG frameDuration;
+    std::shared_ptr<uint8_t[]> staging;
+    {
+        AutoLock lock(_lock);
+        if (_shutdown)
+            return MF_E_SHUTDOWN;
+        if (_state != MF_STREAM_STATE_RUNNING)
+            return MF_E_MEDIA_SOURCE_WRONGSTATE;
+        subtype       = _subtype;
+        width         = _width;
+        height        = _height;
+        frameBytes    = _frameBytes;
+        frameDuration = _frameDuration;
+        staging       = _staging;
+    }
+
+    // Pace delivery to the camera: wait for a frame newer than the last one
+    // we handed out, sleeping on the writer's frame-ready event between
+    // attempts (Sleep-based polling was quantized to the 15.6ms system timer
+    // and silently capped the 100..187fps modes). On deadline we re-deliver
+    // the previous frame so the pipeline keeps flowing even if the host
+    // stalls or exits.
+    const DWORD periodMs = static_cast<DWORD>(frameDuration / 10000);
     const ULONGLONG deadline = GetTickCount64() + periodMs * 2 + 50;
 
     for (;;)
@@ -513,7 +605,7 @@ HRESULT MediaStream::DeliverSample(IUnknown* token)
             if (now >= _nextBusRetryTick)
             {
                 _nextBusRetryTick = now + 500;
-                if (_bus.TryOpen())
+                if (_bus.TryOpen(_cameraIndex))
                     continue;
             }
         }
@@ -524,49 +616,56 @@ HRESULT MediaStream::DeliverSample(IUnknown* token)
             {
                 const uint32_t busWidth = fmt.width;
                 const uint32_t busHeight = fmt.height;
-                const uint32_t busFrameBytes = framebus::Nv12Bytes(busWidth, busHeight);
-                
-                if (busWidth == _width && busHeight == _height)
+                const uint32_t busFrameBytes = framebus::Yuy2Bytes(busWidth, busHeight);
+                const LONG64 lastFrameId = _lastFrameId.load(std::memory_order_relaxed);
+
+                if (busWidth == width && busHeight == height)
                 {
-                    const LONG64 id = _bus.TryReadNewer(_staging.get(), busFrameBytes, _lastFrameId);
+                    const LONG64 id = _bus.TryReadNewer(staging.get(), busFrameBytes, lastFrameId);
                     if (id != 0)
                     {
-                        _lastFrameId = id;
+                        _lastFrameId.store(id, std::memory_order_relaxed);
                         break;
                     }
                 }
                 else
                 {
-                    const LONG64 id = _bus.TryReadNewer(_busStaging.get(), busFrameBytes, _lastFrameId);
+                    const LONG64 id = _bus.TryReadNewer(_busStaging.get(), busFrameBytes, lastFrameId);
                     if (id != 0)
                     {
-                        _lastFrameId = id;
-                        if (busWidth == 320 && busHeight == 240 && _width == 640 && _height == 480)
+                        _lastFrameId.store(id, std::memory_order_relaxed);
+                        if (busWidth == 320 && busHeight == 240 && width == 640 && height == 480)
                         {
-                            UpscaleNv12_2x(_busStaging.get(), _staging.get(), 320, 240);
+                            UpscaleYuy2_2x(_busStaging.get(), staging.get(), 320, 240);
                         }
-                        else if (busWidth == 640 && busHeight == 480 && _width == 320 && _height == 240)
+                        else if (busWidth == 640 && busHeight == 480 && width == 320 && height == 240)
                         {
-                            DownscaleNv12_2x(_busStaging.get(), _staging.get(), 640, 480);
+                            DownscaleYuy2_2x(_busStaging.get(), staging.get(), 640, 480);
                         }
                         else
                         {
-                            FillBlack();
+                            FillYuy2Black(staging.get(), width, height);
                         }
                         break;
                     }
                 }
             }
         }
-        if (GetTickCount64() >= deadline)
+        const ULONGLONG now = GetTickCount64();
+        if (now >= deadline)
             break;
-        Sleep(1);
+        const ULONGLONG remaining = deadline - now;
+        const DWORD waitMs = remaining > 100 ? 100 : static_cast<DWORD>(remaining);
+        if (_bus.IsOpen())
+            _bus.WaitFrame(waitMs);          // woken by the writer per publish
+        else
+            Sleep(waitMs > 20 ? 20 : waitMs);  // host absent: cheap idle wait
     }
 
     ComPtr<IMFSample> sample;
     ComPtr<IMFMediaBuffer> buffer;
     HRESULT hr = MFCreateSample(&sample);
-    if (SUCCEEDED(hr)) hr = MFCreateMemoryBuffer(_frameBytes, &buffer);
+    if (SUCCEEDED(hr)) hr = MFCreateMemoryBuffer(frameBytes, &buffer);
     if (SUCCEEDED(hr))
     {
         BYTE* data = nullptr;
@@ -574,21 +673,22 @@ HRESULT MediaStream::DeliverSample(IUnknown* token)
         hr = buffer->Lock(&data, &maxLen, nullptr);
         if (SUCCEEDED(hr))
         {
-            if (_subtype == MFVideoFormat_YUY2)
+            if (subtype == MFVideoFormat_YUY2)
             {
-                Nv12ToYuy2(_staging.get(), data, _width, _height);
+                // Native path: the bus frame is already YUY2 — no conversion.
+                memcpy(data, staging.get(), frameBytes);
             }
             else
             {
-                memcpy(data, _staging.get(), _frameBytes);
+                Yuy2ToNv12(staging.get(), data, width, height);
             }
             buffer->Unlock();
-            buffer->SetCurrentLength(_frameBytes);
+            buffer->SetCurrentLength(frameBytes);
         }
     }
     if (SUCCEEDED(hr)) hr = sample->AddBuffer(buffer.Get());
     if (SUCCEEDED(hr)) hr = sample->SetSampleTime(MFGetSystemTime());
-    if (SUCCEEDED(hr)) hr = sample->SetSampleDuration(_frameDuration);
+    if (SUCCEEDED(hr)) hr = sample->SetSampleDuration(frameDuration);
     if (SUCCEEDED(hr) && token)
         hr = sample->SetUnknown(MFSampleExtension_Token, token);
 
@@ -656,7 +756,7 @@ STDMETHODIMP MediaStream::KsEvent(void*, ULONG, void*, ULONG, ULONG* BytesReturn
 // MediaSource
 // ===========================================================================
 
-MediaSource::MediaSource()
+MediaSource::MediaSource(int cameraIndex) : _cameraIndex(cameraIndex)
 {
     DllAddRef();
 }
@@ -671,7 +771,7 @@ HRESULT MediaSource::Initialize(IMFAttributes* activationAttributes)
     if (activationAttributes)
         activationAttributes->CopyAllItems(_attributes.Get());
 
-    _stream.Attach(new (std::nothrow) MediaStream(this));
+    _stream.Attach(new (std::nothrow) MediaStream(this, _cameraIndex));
     if (!_stream)
         return E_OUTOFMEMORY;
     hr = _stream->Initialize();

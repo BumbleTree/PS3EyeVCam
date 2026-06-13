@@ -31,37 +31,20 @@ void HostLog(const wchar_t* fmt, ...)
 namespace
 {
 
-// BT.601 limited-range BGRA -> NV12, 2x2 blocks (chroma from the 4-pixel mean).
-void BgraToNv12(const uint8_t* bgra, uint8_t* nv12, uint32_t w, uint32_t h)
+static SRWLOCK g_devicesLock = SRWLOCK_INIT;
+
+// MFCreateVirtualCamera lives in mfsensorgroup.dll (Windows 11 22000+).
+// Resolved once for the whole process; the module is never freed (its
+// lifetime is the process's). Thread-safe via C++11 magic-static init.
+PFN_MFCreateVirtualCamera GetMFCreateVirtualCamera()
 {
-    uint8_t* yPlane = nv12;
-    uint8_t* uvPlane = nv12 + static_cast<size_t>(w) * h;
-
-    for (uint32_t y = 0; y < h; y += 2)
-    {
-        const uint8_t* row0 = bgra + static_cast<size_t>(y) * w * 4;
-        const uint8_t* row1 = row0 + static_cast<size_t>(w) * 4;
-        uint8_t* y0 = yPlane + static_cast<size_t>(y) * w;
-        uint8_t* y1 = y0 + w;
-        uint8_t* uv = uvPlane + static_cast<size_t>(y / 2) * w;
-
-        for (uint32_t x = 0; x < w; x += 2)
-        {
-            int rSum = 0, gSum = 0, bSum = 0;
-            const uint8_t* px[4] = { row0 + x * 4, row0 + (x + 1) * 4,
-                                     row1 + x * 4, row1 + (x + 1) * 4 };
-            uint8_t* yOut[4] = { y0 + x, y0 + x + 1, y1 + x, y1 + x + 1 };
-            for (int i = 0; i < 4; ++i)
-            {
-                const int b = px[i][0], g = px[i][1], r = px[i][2];
-                rSum += r; gSum += g; bSum += b;
-                *yOut[i] = static_cast<uint8_t>(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
-            }
-            const int r = rSum / 4, g = gSum / 4, b = bSum / 4;
-            uv[x]     = static_cast<uint8_t>(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
-            uv[x + 1] = static_cast<uint8_t>(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
-        }
-    }
+    static PFN_MFCreateVirtualCamera fn = []() -> PFN_MFCreateVirtualCamera {
+        HMODULE module = LoadLibraryW(L"mfsensorgroup.dll");
+        return module ? reinterpret_cast<PFN_MFCreateVirtualCamera>(
+                            GetProcAddress(module, "MFCreateVirtualCamera"))
+                      : nullptr;
+    }();
+    return fn;
 }
 
 // Push every sensor-level setting to the camera (order-safe live or pre-start).
@@ -79,25 +62,36 @@ void ApplySensorSettings(const ps3eye::PS3EYECam::PS3EYERef& eye, const Settings
         eye->setGain(static_cast<uint8_t>(s.gain));
         eye->setExposure(static_cast<uint8_t>(s.exposure));
     }
+
+    if (!s.autoWhiteBalance)
+    {
+        eye->setRedBalance(static_cast<uint8_t>(s.redBalance));
+        eye->setBlueBalance(static_cast<uint8_t>(s.blueBalance));
+        eye->setGreenBalance(static_cast<uint8_t>(s.greenBalance));
+    }
+
+    eye->setTestPattern(s.testPattern);
 }
 
 } // namespace
 
 // ---------------------------------------------------------------------------
 
-bool CaptureController::Start(HWND notifyWnd, UINT notifyMsg)
+bool CaptureController::Start(int cameraIndex, HWND notifyWnd, UINT notifyMsg)
 {
+    _cameraIndex = cameraIndex;
     _notifyWnd = notifyWnd;
     _notifyMsg = notifyMsg;
     {
         AcquireSRWLockExclusive(&_settingsLock);
-        _desired = settings::Load();
+        _desired = settings::Load(_cameraIndex);
         _active = _desired;
         ReleaseSRWLockExclusive(&_settingsLock);
     }
-    _stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    _cmdEvent  = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!_stopEvent || !_cmdEvent)
+    _stopEvent   = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    _cmdEvent    = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    _rescanEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!_stopEvent || !_cmdEvent || !_rescanEvent)
         return false;
     _thread = CreateThread(nullptr, 0, ThreadProc, this, 0, nullptr);
     return _thread != nullptr;
@@ -109,12 +103,14 @@ void CaptureController::Stop()
         SetEvent(_stopEvent);
     if (_thread)
     {
-        WaitForSingleObject(_thread, 15000);
+        if (WaitForSingleObject(_thread, 15000) != WAIT_OBJECT_0)
+            HostLog(L"camera %d: thread did not exit within 15s -- abandoning it", _cameraIndex);
         CloseHandle(_thread);
         _thread = nullptr;
     }
-    if (_stopEvent) { CloseHandle(_stopEvent); _stopEvent = nullptr; }
-    if (_cmdEvent)  { CloseHandle(_cmdEvent);  _cmdEvent = nullptr; }
+    if (_stopEvent)   { CloseHandle(_stopEvent);   _stopEvent = nullptr; }
+    if (_cmdEvent)    { CloseHandle(_cmdEvent);    _cmdEvent = nullptr; }
+    if (_rescanEvent) { CloseHandle(_rescanEvent); _rescanEvent = nullptr; }
 }
 
 void CaptureController::UpdateSettings(const Settings& s)
@@ -125,6 +121,12 @@ void CaptureController::UpdateSettings(const Settings& s)
     _settingsDirty.store(true, std::memory_order_release);
     if (_cmdEvent)
         SetEvent(_cmdEvent);
+}
+
+void CaptureController::NotifyDeviceChange()
+{
+    if (_rescanEvent)
+        SetEvent(_rescanEvent);
 }
 
 Settings CaptureController::ActiveSettings() const
@@ -138,7 +140,7 @@ Settings CaptureController::ActiveSettings() const
 void CaptureController::SetState(State s)
 {
     if (_state.exchange(s, std::memory_order_relaxed) != s && _notifyWnd)
-        PostMessage(_notifyWnd, _notifyMsg, static_cast<WPARAM>(static_cast<int>(s)), 0);
+        PostMessage(_notifyWnd, _notifyMsg, static_cast<WPARAM>(static_cast<int>(s)), static_cast<LPARAM>(_cameraIndex));
 }
 
 DWORD WINAPI CaptureController::ThreadProc(LPVOID self)
@@ -155,7 +157,7 @@ void CaptureController::Run()
     Settings active = ActiveSettings();
 
     framebus::Writer bus;
-    if (!bus.Create(active.width, active.height, active.fps, 1))
+    if (!bus.Create(_cameraIndex, active.width, active.height, active.fps, 1))
     {
         HostLog(L"FATAL: FrameBus creation failed (win32=%lu) -- not elevated?", bus.LastError());
         SetState(State::Fatal);
@@ -166,7 +168,7 @@ void CaptureController::Run()
     bus.PublishBlack();
 
     controlbus::Host control;
-    if (!control.Create())
+    if (!control.Create(_cameraIndex))
     {
         HostLog(L"FATAL: ControlBus creation failed (win32=%lu)", GetLastError());
         SetState(State::Fatal);
@@ -175,12 +177,8 @@ void CaptureController::Run()
         return;
     }
 
-    // ---- virtual camera registration (retried while it fails) -------------
-    HMODULE sensorGroup = LoadLibraryW(L"mfsensorgroup.dll");
-    auto createVCam = sensorGroup
-        ? reinterpret_cast<PFN_MFCreateVirtualCamera>(
-              GetProcAddress(sensorGroup, "MFCreateVirtualCamera"))
-        : nullptr;
+    // ---- virtual camera registration (dynamic, slot-occupancy driven) -----
+    PFN_MFCreateVirtualCamera createVCam = GetMFCreateVirtualCamera();
 
     ComPtr<IMFVirtualCamera> vcam;
     bool vcamLive = false;
@@ -194,13 +192,14 @@ void CaptureController::Run()
         HRESULT hr = createVCam(MFVirtualCameraType_SoftwareCameraSource,
                                 MFVirtualCameraLifetime_Session,
                                 MFVirtualCameraAccess_CurrentUser,
-                                kVCamFriendlyName, kVCamClsidString, nullptr, 0, &vcam);
+                                kVCamFriendlyNames[_cameraIndex], kVCamClsidStrings[_cameraIndex], nullptr, 0, &vcam);
         if (SUCCEEDED(hr))
             hr = vcam->Start(nullptr);
         if (SUCCEEDED(hr))
         {
             vcamLive = true;
-            HostLog(L"virtual camera registered and started");
+            vcamAttempts = 0;
+            HostLog(L"camera %d: virtual camera registered and started", _cameraIndex);
         }
         else
         {
@@ -208,36 +207,64 @@ void CaptureController::Run()
             // Right after logon MF may not be ready yet: 5 quick attempts at
             // 2s, then every 30s forever.
             vcamRetryDue = GetTickCount64() + (vcamAttempts < 5 ? 2000 : 30000);
-            HostLog(L"virtual camera registration failed 0x%08X (attempt %d)", hr, vcamAttempts);
+            HostLog(L"camera %d: virtual camera registration failed 0x%08X (attempt %d)",
+                    _cameraIndex, hr, vcamAttempts);
             SetState(State::VCamFailed);
         }
     };
+
+    auto unregisterVCam = [&]() {
+        if (!vcamLive && !vcam)
+            return;
+        if (vcam)
+        {
+            vcam->Stop();
+            vcam->Remove();
+            vcam->Shutdown();
+            vcam.Reset();
+        }
+        vcamLive = false;
+        vcamAttempts = 0;
+        vcamRetryDue = 0;
+        HostLog(L"camera %d: virtual camera unregistered", _cameraIndex);
+    };
+
     if (!createVCam)
     {
         HostLog(L"FATAL: MFCreateVirtualCamera unavailable -- Windows 11 22000+ required");
         SetState(State::Fatal);
     }
-    else
-    {
-        tryRegisterVCam();
-    }
 
     // ---- camera state ------------------------------------------------------
     ps3eye::PS3EYECam::PS3EYERef eye;
 
-    const uint32_t maxBgraBytes = framebus::kMaxWidth * framebus::kMaxHeight * 4;
-    std::unique_ptr<uint8_t[]> bgra(new uint8_t[maxBgraBytes]);
-    std::unique_ptr<uint8_t[]> nv12(new uint8_t[framebus::kMaxFrameBytes]);
+    // getFrame writes publish-ready YUY2 straight into this buffer (the
+    // Bayer->YUY2 debayer is fused inside the driver; no RGB intermediate).
+    std::unique_ptr<uint8_t[]> yuy2(new uint8_t[framebus::kMaxFrameBytes]);
+
+    // True while a physical PS3 Eye occupies this slot. Refreshes the global
+    // slot map (cheap libusb descriptor walk; only runs while not streaming).
+    auto slotOccupied = [&]() -> bool {
+        AcquireSRWLockExclusive(&g_devicesLock);
+        const auto& devices = ps3eye::PS3EYECam::getDevices(true);
+        const bool present = devices.size() > static_cast<size_t>(_cameraIndex) &&
+                             devices[_cameraIndex] != nullptr;
+        ReleaseSRWLockExclusive(&g_devicesLock);
+        return present;
+    };
 
     auto releaseCamera = [&]() {
         if (eye)
         {
-            eye->stop();      // sensor off, LED off, URB thread joins
+            eye->stop();      // sensor off, LED off, transfers cancelled, USB interface released
             eye.reset();
         }
-        // The driver's static device list holds the last reference; refreshing
-        // it destroys the object -> close_usb() -> USB interface released.
+        // Refresh the slot map: drops devices that were unplugged and repairs
+        // slots whose camera was replugged (stale libusb_device swapped for
+        // the live one). The slot keeps the same index throughout.
+        AcquireSRWLockExclusive(&g_devicesLock);
         ps3eye::PS3EYECam::getDevices(true);
+        ReleaseSRWLockExclusive(&g_devicesLock);
         _fpsX10.store(0, std::memory_order_relaxed);
     };
 
@@ -276,12 +303,16 @@ void CaptureController::Run()
             desired.flipH != active.flipH || desired.flipV != active.flipV ||
             desired.autoGain != active.autoGain || desired.gain != active.gain ||
             desired.exposure != active.exposure ||
-            desired.autoWhiteBalance != active.autoWhiteBalance;
+            desired.autoWhiteBalance != active.autoWhiteBalance ||
+            desired.redBalance != active.redBalance || desired.blueBalance != active.blueBalance ||
+            desired.greenBalance != active.greenBalance || desired.testPattern != active.testPattern;
 
         active.flipH = desired.flipH;       active.flipV = desired.flipV;
         active.autoGain = desired.autoGain; active.gain = desired.gain;
         active.exposure = desired.exposure; active.autoWhiteBalance = desired.autoWhiteBalance;
         active.idleTimeoutMs = desired.idleTimeoutMs;
+        active.redBalance = desired.redBalance; active.blueBalance = desired.blueBalance;
+        active.greenBalance = desired.greenBalance; active.testPattern = desired.testPattern;
 
         if (cameraLive && sensorChanged && eye)
             ApplySensorSettings(eye, active);
@@ -298,33 +329,46 @@ void CaptureController::Run()
         drainSettings(false);
     };
 
-    // Returns true when the physical camera is up and streaming.
-    auto wakeCamera = [&]() -> bool {
+    // SlotEmpty (device physically absent) is distinguished from InitFailed
+    // (device present but USB setup failed): the former unregisters the
+    // virtual camera, the latter keeps it and retries.
+    enum class WakeResult { Ok, SlotEmpty, InitFailed };
+    auto wakeCamera = [&]() -> WakeResult {
+        AcquireSRWLockExclusive(&g_devicesLock);
         const auto& devices = ps3eye::PS3EYECam::getDevices(true);
-        if (devices.empty())
-            return false;
-        eye = devices[0];
-        if (!eye->init(active.width, active.height, static_cast<uint16_t>(active.fps),
-                       ps3eye::PS3EYECam::EOutputFormat::BGRA))
+        if (devices.size() <= static_cast<size_t>(_cameraIndex) || !devices[_cameraIndex])
         {
+            ReleaseSRWLockExclusive(&g_devicesLock);
+            return WakeResult::SlotEmpty;
+        }
+        eye = devices[_cameraIndex];
+        ReleaseSRWLockExclusive(&g_devicesLock);
+        if (!eye->init(active.width, active.height, static_cast<uint16_t>(active.fps),
+                       ps3eye::PS3EYECam::EOutputFormat::YUY2))
+        {
+            eye->release();   // close the USB handle; don't hold it while idle
             eye.reset();
-            return false;
+            return WakeResult::InitFailed;
         }
         ApplySensorSettings(eye, active);
-        eye->start();
-        return true;
+        if (!eye->start())
+        {
+            eye->release();
+            eye.reset();
+            return WakeResult::InitFailed;
+        }
+        return WakeResult::Ok;
     };
 
     // ---- state machine ------------------------------------------------------
     enum class Phase { Asleep, Waking, Streaming };
     Phase phase = Phase::Asleep;
-    SetState(vcamLive ? State::Asleep : GetState());
 
     int consecutiveTimeouts = 0;
     uint32_t framesInWindow = 0;
     ULONGLONG windowStart = GetTickCount64();
 
-    HANDLE asleepWaits[3] = { _stopEvent, _cmdEvent, control.WakeEvent() };
+    HANDLE asleepWaits[4] = { _stopEvent, _cmdEvent, control.WakeEvent(), _rescanEvent };
     HANDLE briefWaits[2]  = { _stopEvent, _cmdEvent };
 
     bool stopping = false;
@@ -338,31 +382,43 @@ void CaptureController::Run()
             control.ResetWake();
             drainSettings(false);
             applyPendingMode();
+
+            // Reconcile the virtual camera with slot occupancy: registered
+            // while a physical camera is attached, gone otherwise.
+            bool present = false;
+            if (createVCam)
+            {
+                present = slotOccupied();
+                if (present && !vcamLive)
+                    tryRegisterVCam();
+                else if (!present && vcamLive)
+                    unregisterVCam();
+            }
+
             if (vcamLive && control.ActivityAgeMs() < active.idleTimeoutMs)
             {
                 phase = Phase::Waking;
                 break;
             }
-            SetState(vcamLive ? State::Asleep : GetState());
+            if (createVCam)
+                SetState(!present ? State::CameraMissing
+                                  : (vcamLive ? State::Asleep : State::VCamFailed));
 
             DWORD timeout = INFINITE;
-            if (!vcamLive)
+            if (createVCam)
             {
                 const ULONGLONG now = GetTickCount64();
-                timeout = vcamRetryDue > now ? static_cast<DWORD>(vcamRetryDue - now) : 0;
+                if (!present)
+                    timeout = 5000;  // fallback arrival poll (device notification may race libusb)
+                else if (!vcamLive)
+                    timeout = vcamRetryDue > now ? static_cast<DWORD>(vcamRetryDue - now) : 0;
             }
-            const DWORD r = WaitForMultipleObjects(3, asleepWaits, FALSE, timeout);
+
+            const DWORD r = WaitForMultipleObjects(4, asleepWaits, FALSE, timeout);
             if (r == WAIT_OBJECT_0)            // stop
                 stopping = true;
-            else if (r == WAIT_OBJECT_0 + 1)   // settings command
-            {
-                drainSettings(false);
-                applyPendingMode();
-            }
-            else if (r == WAIT_OBJECT_0 + 2)   // wake ping from the DLL
-                phase = Phase::Waking;
-            else                               // timeout -> vcam retry due
-                tryRegisterVCam();
+            // Settings command, wake ping, device change, or timeout: loop —
+            // the top of the Asleep pass re-evaluates everything.
             break;
         }
 
@@ -376,9 +432,10 @@ void CaptureController::Run()
                 break;
             }
             SetState(State::Waking);
-            if (wakeCamera())
+            const WakeResult wake = wakeCamera();
+            if (wake == WakeResult::Ok)
             {
-                HostLog(L"camera awake: %ux%u@%u", active.width, active.height, active.fps);
+                HostLog(L"camera %d awake: %ux%u@%u", _cameraIndex, active.width, active.height, active.fps);
                 SetState(State::Streaming);
                 consecutiveTimeouts = 0;
                 framesInWindow = 0;
@@ -386,8 +443,18 @@ void CaptureController::Run()
                 phase = Phase::Streaming;
                 break;
             }
+            if (wake == WakeResult::SlotEmpty)
+            {
+                // Device physically gone: take the virtual camera offline so
+                // apps stop seeing a dead "PS3 Eye" entry.
+                unregisterVCam();
+                SetState(State::CameraMissing);
+                phase = Phase::Asleep;
+                break;
+            }
             SetState(State::CameraMissing);
-            // Retry every 2s while a client keeps asking; drop to sleep otherwise.
+            // Device present but USB setup failed: retry every 2s while a
+            // client keeps asking; drop to sleep otherwise.
             const DWORD r = WaitForMultipleObjects(2, briefWaits, FALSE, 2000);
             if (r == WAIT_OBJECT_0)
                 stopping = true;
@@ -401,11 +468,10 @@ void CaptureController::Run()
                 stopping = true;
                 break;
             }
-            if (eye->getFrame(bgra.get(), 500))
+            if (eye->getFrame(yuy2.get(), 500))
             {
                 consecutiveTimeouts = 0;
-                BgraToNv12(bgra.get(), nv12.get(), active.width, active.height);
-                bus.Publish(nv12.get(), framebus::Nv12Bytes(active.width, active.height));
+                bus.Publish(yuy2.get(), framebus::Yuy2Bytes(active.width, active.height));
 
                 ++framesInWindow;
                 const ULONGLONG now = GetTickCount64();
@@ -419,7 +485,7 @@ void CaptureController::Run()
             }
             else if (++consecutiveTimeouts >= 4)
             {
-                HostLog(L"camera stopped delivering frames -- device lost?");
+                HostLog(L"camera %d stopped delivering frames -- device lost?", _cameraIndex);
                 releaseCamera();
                 phase = Phase::Waking;  // immediate retry covers replug
                 break;
@@ -429,7 +495,7 @@ void CaptureController::Run()
 
             if (control.ActivityAgeMs() >= active.idleTimeoutMs)
             {
-                HostLog(L"no clients for %ums -- camera going to sleep", active.idleTimeoutMs);
+                HostLog(L"camera %d: no clients for %ums -- going to sleep", _cameraIndex, active.idleTimeoutMs);
                 releaseCamera();
                 bus.PublishBlack();
                 applyPendingMode();
@@ -443,16 +509,10 @@ void CaptureController::Run()
     // ---- ordered teardown ---------------------------------------------------
     releaseCamera();
     bus.PublishBlack();
-    if (vcam)
-    {
-        vcam->Stop();
-        vcam->Remove();
-        vcam->Shutdown();
-        vcam.Reset();
-    }
+    unregisterVCam();
     control.Close();
     bus.Close();
     MFShutdown();
     CoUninitialize();
-    HostLog(L"camera thread exited");
+    HostLog(L"camera %d thread exited", _cameraIndex);
 }

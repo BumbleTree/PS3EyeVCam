@@ -1,20 +1,24 @@
 @echo off
 rem Completely removes the PS3 Eye virtual camera: process, logon task,
-rem DLL registration, settings, files. Must run as Administrator.
-rem - self-elevates if run as standard user
+rem DLL registration, driver, certificate, settings, files.
+rem Must run as Administrator.
+rem - self-elevates if run as standard user (BEFORE the temp-copy relaunch,
+rem   so only one UAC prompt / console window ever appears)
+rem - re-runs itself from %temp% so the install folder isn't locked
 setlocal
-
-:: If not running the temp copy, copy to temp and run from there so we don't lock %DEST%
-if /i "%~nx0" neq "uninstall_temp.bat" (
-    copy /y "%~f0" "%temp%\uninstall_temp.bat" >nul
-    start "" "%temp%\uninstall_temp.bat"
-    exit /b
-)
 
 net session >nul 2>&1
 if %errorlevel% neq 0 (
     echo Requesting administrative privileges...
     powershell -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+    exit /b
+)
+
+:: Already elevated here. If not running the temp copy, copy to temp and run
+:: from there so we don't lock %DEST% (the started child inherits elevation).
+if /i "%~nx0" neq "uninstall_temp.bat" (
+    copy /y "%~f0" "%temp%\uninstall_temp.bat" >nul
+    start "" "%temp%\uninstall_temp.bat"
     exit /b
 )
 
@@ -41,22 +45,20 @@ if exist "%DEST%\PS3EyeVCam.dll" (
 
 echo Deleting registry settings...
 reg delete "HKLM\SOFTWARE\PS3EyeVCam" /f >nul 2>&1
+reg delete "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\PS3EyeVCam" /f >nul 2>&1
 
 echo Removing Video Driver...
 powershell -Command "$oem = Get-WindowsDriver -Online | Where-Object { $_.OriginalFileName -like '*usb_device.inf' } | Select-Object -ExpandProperty Driver; if ($oem) { pnputil /delete-driver $oem /uninstall /force }" >nul 2>&1
 
-
 echo Removing WinUSB Driver Certificate...
 if exist "%DEST%\driver\usb_device.cer" (
+    rem Thumbprint derived from the shipped certificate itself -- nothing
+    rem hardcoded, so re-signed builds always clean up the right cert.
     for /f "tokens=*" %%a in ('powershell -Command "Get-PfxCertificate -FilePath '%DEST%\driver\usb_device.cer' | Select-Object -ExpandProperty Thumbprint"') do (
         certutil -delstore "Root" "%%a" >nul 2>&1
         certutil -delstore "TrustedPublisher" "%%a" >nul 2>&1
     )
 )
-certutil -delstore "Root" "7512009F4ABF479DB61559810A5B1DE9C8007723" >nul 2>&1
-certutil -delstore "TrustedPublisher" "7512009F4ABF479DB61559810A5B1DE9C8007723" >nul 2>&1
-certutil -delstore "Root" "d0a3c5233b11288afa8d6924949d985988b536f6" >nul 2>&1
-certutil -delstore "TrustedPublisher" "d0a3c5233b11288afa8d6924949d985988b536f6" >nul 2>&1
 
 echo Cleaning up files...
 if exist "%DEST%" (
@@ -74,3 +76,7 @@ echo - Registry settings deleted.
 echo.
 pause
 endlocal
+
+:: Self-delete the temp copy: "(goto) 2>nul" ends batch-file parsing while the
+:: rest of the line still runs in the parent cmd context.
+(goto) 2>nul & del "%~f0"

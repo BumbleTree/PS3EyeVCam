@@ -3,21 +3,30 @@
 #include <commctrl.h>
 #include <shellapi.h>
 #include <windowsx.h>
+#include <dbt.h>
 #include <cstdio>
 
 #include "SettingsDialog.h"
 #include "Autostart.h"
+#include "../common/VCamGuids.h"
 #include "../res/resource.h"
 
 namespace
 {
 constexpr UINT kTrayIconId = 1;
+
+// DeviceInterfaceGUIDs value installed by driver/usb_device.inf for the
+// PS3 Eye's WinUSB video interface (MI_00). Arrival/removal of this
+// interface is exactly the moment libusb can/can't open the camera.
+constexpr GUID kPs3EyeInterfaceGuid =
+    { 0x4bcc4c51, 0x4249, 0x4ae8, { 0x98, 0xbf, 0x35, 0x6b, 0x2c, 0x53, 0x0e, 0x77 } };
 }
 
-bool TrayUI::Create(HINSTANCE instance, CaptureController* controller)
+bool TrayUI::Create(HINSTANCE instance, CaptureController* controllers)
 {
     _instance = instance;
-    _controller = controller;
+    _controllers = controllers;
+    _controller = &controllers[0];
 
     LoadIconMetric(instance, MAKEINTRESOURCEW(IDI_APP), LIM_SMALL, &_icon);
 
@@ -42,6 +51,14 @@ bool TrayUI::Create(HINSTANCE instance, CaptureController* controller)
     ChangeWindowMessageFilterEx(_hwnd, _taskbarCreatedMsg, MSGFLT_ALLOW, nullptr);
     ChangeWindowMessageFilterEx(_hwnd, WM_SHOW_SETTINGS, MSGFLT_ALLOW, nullptr);
 
+    // Subscribe to PS3 Eye interface arrival/removal so the capture threads
+    // can re-evaluate slot occupancy immediately instead of polling.
+    DEV_BROADCAST_DEVICEINTERFACE_W filter{};
+    filter.dbcc_size = sizeof(filter);
+    filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
+    filter.dbcc_classguid = kPs3EyeInterfaceGuid;
+    _devNotify = RegisterDeviceNotificationW(_hwnd, &filter, DEVICE_NOTIFY_WINDOW_HANDLE);
+
     AddTrayIcon();
     return true;
 }
@@ -49,6 +66,11 @@ bool TrayUI::Create(HINSTANCE instance, CaptureController* controller)
 void TrayUI::Destroy()
 {
     RemoveTrayIcon();
+    if (_devNotify)
+    {
+        UnregisterDeviceNotification(_devNotify);
+        _devNotify = nullptr;
+    }
     if (_hwnd)
     {
         DestroyWindow(_hwnd);
@@ -98,29 +120,49 @@ void TrayUI::UpdateTooltip()
     nid.uID = kTrayIconId;
     nid.uFlags = NIF_TIP | NIF_SHOWTIP;
 
-    const Settings s = _controller->ActiveSettings();
-    switch (_controller->GetState())
+    int streamingCount = 0;
+    int asleepCount = 0;
+    int failedCount = 0;
+    float maxFps = 0.0f;
+
+    for (int i = 0; i < kVCamCount; ++i)
     {
-    case CaptureController::State::Streaming:
-        swprintf_s(nid.szTip, L"PS3 Eye — streaming %ux%u @ %.1f fps",
-                   s.width, s.height, _controller->MeasuredFpsX10() / 10.0);
-        break;
-    case CaptureController::State::Asleep:
-        wcscpy_s(nid.szTip, L"PS3 Eye — idle (camera sleeping)");
-        break;
-    case CaptureController::State::Waking:
-        wcscpy_s(nid.szTip, L"PS3 Eye — waking…");
-        break;
-    case CaptureController::State::CameraMissing:
-        wcscpy_s(nid.szTip, L"PS3 Eye — camera not detected");
-        break;
-    case CaptureController::State::VCamFailed:
-        wcscpy_s(nid.szTip, L"PS3 Eye — virtual camera error (retrying)");
-        break;
-    default:
-        wcscpy_s(nid.szTip, L"PS3 Eye Virtual Camera");
-        break;
+        switch (_controllers[i].GetState())
+        {
+        case CaptureController::State::Streaming:
+            streamingCount++;
+            if (_controllers[i].MeasuredFpsX10() / 10.0f > maxFps)
+                maxFps = _controllers[i].MeasuredFpsX10() / 10.0f;
+            break;
+        case CaptureController::State::Asleep:
+            asleepCount++;
+            break;
+        case CaptureController::State::VCamFailed:
+            failedCount++;
+            break;
+        default:
+            break;
+        }
     }
+
+    if (streamingCount > 0)
+    {
+        swprintf_s(nid.szTip, L"PS3 Eye — %d streaming (max %.1f fps), %d idle",
+                   streamingCount, maxFps, asleepCount);
+    }
+    else if (failedCount > 0)
+    {
+        wcscpy_s(nid.szTip, L"PS3 Eye — virtual camera error (retrying)");
+    }
+    else if (asleepCount > 0)
+    {
+        swprintf_s(nid.szTip, L"PS3 Eye — %d idle (camera sleeping)", asleepCount);
+    }
+    else
+    {
+        wcscpy_s(nid.szTip, L"PS3 Eye — no cameras detected");
+    }
+
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
@@ -137,22 +179,25 @@ void TrayUI::ShowBalloon(const wchar_t* title, const wchar_t* text)
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
-void TrayUI::ApplySettings(const Settings& s, bool persistNow)
+void TrayUI::ApplySettings(int cameraIndex, const Settings& s, bool persistNow)
 {
-    const Settings before = _controller->ActiveSettings();
-    const bool modeChanged = !s.SameMode(before);
-    _controller->UpdateSettings(s);
+    if (cameraIndex < 0 || cameraIndex >= kVCamCount)
+        return;
+    _controllers[cameraIndex].UpdateSettings(s);
     if (persistNow)
-        settings::Save(s);
-    if (modeChanged && _controller->GetState() == CaptureController::State::Streaming)
+        settings::Save(cameraIndex, s);
+
+    if (_controllers[cameraIndex].GetState() == CaptureController::State::Streaming && !s.SameMode(_controllers[cameraIndex].ActiveSettings()))
+    {
         ShowBalloon(L"Mode change queued",
                     L"The new video mode will apply when no app is using the camera.");
+    }
 }
 
 void TrayUI::ShowContextMenu(POINT anchor)
 {
     HMENU menu = CreatePopupMenu();
-    const Settings s = settings::Load();
+    const Settings s = settings::Load(0);
     const int activeMode = settings::FindModeIndex(s.width, s.height, s.fps);
 
     HMENU modeMenu = CreatePopupMenu();
@@ -167,6 +212,9 @@ void TrayUI::ShowContextMenu(POINT anchor)
 
     AppendMenuW(menu, MF_STRING, IDM_SETTINGS, L"&Settings…");
     SetMenuDefaultItem(menu, IDM_SETTINGS, FALSE);
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    // Quick toggles act on camera 0 only; per-camera control is in Settings.
+    AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, kVCamFriendlyNames[0]);
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(modeMenu), L"Video &mode");
     AppendMenuW(menu, MF_STRING | (s.flipH ? MF_CHECKED : 0), IDM_FLIPH, L"Flip &horizontally");
     AppendMenuW(menu, MF_STRING | (s.flipV ? MF_CHECKED : 0), IDM_FLIPV, L"Flip &vertically");
@@ -188,10 +236,10 @@ void TrayUI::OnCommand(int id)
 {
     if (id >= IDM_MODE_BASE && id < IDM_MODE_BASE + kVideoModeCount)
     {
-        Settings s = settings::Load();
+        Settings s = settings::Load(0);
         const VideoMode& m = kVideoModes[id - IDM_MODE_BASE];
         s.width = m.width; s.height = m.height; s.fps = m.fps;
-        ApplySettings(s, true);
+        ApplySettings(0, s, true);
         settingsdialog::RefreshStatus();
         return;
     }
@@ -203,23 +251,23 @@ void TrayUI::OnCommand(int id)
         break;
     case IDM_FLIPH:
     {
-        Settings s = settings::Load();
+        Settings s = settings::Load(0);
         s.flipH = !s.flipH;
-        ApplySettings(s, true);
+        ApplySettings(0, s, true);
         break;
     }
     case IDM_FLIPV:
     {
-        Settings s = settings::Load();
+        Settings s = settings::Load(0);
         s.flipV = !s.flipV;
-        ApplySettings(s, true);
+        ApplySettings(0, s, true);
         break;
     }
     case IDM_AUTOGAIN:
     {
-        Settings s = settings::Load();
+        Settings s = settings::Load(0);
         s.autoGain = !s.autoGain;
-        ApplySettings(s, true);
+        ApplySettings(0, s, true);
         break;
     }
     case IDM_AUTOSTART:
@@ -282,6 +330,18 @@ LRESULT TrayUI::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
         }
         return 0;
+
+    case WM_DEVICECHANGE:
+        if ((wParam == DBT_DEVICEARRIVAL || wParam == DBT_DEVICEREMOVECOMPLETE) && lParam)
+        {
+            const auto* hdr = reinterpret_cast<const DEV_BROADCAST_HDR*>(lParam);
+            if (hdr->dbch_devicetype == DBT_DEVTYP_DEVICEINTERFACE && _controllers)
+            {
+                for (int i = 0; i < kVCamCount; ++i)
+                    _controllers[i].NotifyDeviceChange();
+            }
+        }
+        return TRUE;
 
     case WM_CONTROLLER_STATE:
         UpdateTooltip();

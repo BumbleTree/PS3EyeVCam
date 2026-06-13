@@ -21,11 +21,11 @@ void DllRelease() { InterlockedDecrement(&g_objectCount); }
 class Activator final : public IMFActivate
 {
 public:
-    static HRESULT CreateInstance(REFIID riid, void** ppv)
+    static HRESULT CreateInstance(REFIID riid, void** ppv, int cameraIndex)
     {
         if (!ppv)
             return E_POINTER;
-        Activator* activator = new (std::nothrow) Activator();
+        Activator* activator = new (std::nothrow) Activator(cameraIndex);
         if (!activator)
             return E_OUTOFMEMORY;
         HRESULT hr = activator->Initialize();
@@ -71,7 +71,7 @@ public:
         if (!_source)
         {
             ComPtr<MediaSource> source;
-            source.Attach(new (std::nothrow) MediaSource());
+            source.Attach(new (std::nothrow) MediaSource(_cameraIndex));
             if (!source)
                 return E_OUTOFMEMORY;
             HRESULT hr = source->Initialize(_attributes.Get());
@@ -136,13 +136,14 @@ public:
     STDMETHODIMP CopyAllItems(IMFAttributes* dest) override { return _attributes->CopyAllItems(dest); }
 
 private:
-    Activator() { DllAddRef(); }
+    Activator(int cameraIndex) : _cameraIndex(cameraIndex) { DllAddRef(); }
     virtual ~Activator() = default;
 
     HRESULT Initialize() { return MFCreateAttributes(&_attributes, 4); }
 
     LONG    _refCount = 1;
     CritSec _lock;
+    int     _cameraIndex;
     ComPtr<IMFAttributes> _attributes;
     ComPtr<MediaSource>   _source;
 };
@@ -154,7 +155,7 @@ private:
 class ClassFactory final : public IClassFactory
 {
 public:
-    ClassFactory() { DllAddRef(); }
+    ClassFactory(int cameraIndex) : _cameraIndex(cameraIndex) { DllAddRef(); }
 
     STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override
     {
@@ -184,7 +185,7 @@ public:
     {
         if (pUnkOuter)
             return CLASS_E_NOAGGREGATION;
-        return Activator::CreateInstance(riid, ppv);
+        return Activator::CreateInstance(riid, ppv, _cameraIndex);
     }
 
     STDMETHODIMP LockServer(BOOL fLock) override
@@ -196,6 +197,7 @@ public:
 private:
     virtual ~ClassFactory() = default;
     LONG _refCount = 1;
+    int  _cameraIndex;
 };
 
 // ===========================================================================
@@ -219,9 +221,19 @@ STDAPI DllCanUnloadNow()
 
 STDAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, void** ppv)
 {
-    if (rclsid != CLSID_PS3EyeVCam)
+    int cameraIndex = -1;
+    for (int i = 0; i < kVCamCount; ++i)
+    {
+        if (rclsid == CLSID_PS3EyeVCams[i])
+        {
+            cameraIndex = i;
+            break;
+        }
+    }
+    if (cameraIndex == -1)
         return CLASS_E_CLASSNOTAVAILABLE;
-    ClassFactory* factory = new (std::nothrow) ClassFactory();
+
+    ClassFactory* factory = new (std::nothrow) ClassFactory(cameraIndex);
     if (!factory)
         return E_OUTOFMEMORY;
     HRESULT hr = factory->QueryInterface(riid, ppv);
@@ -237,42 +249,60 @@ STDAPI DllRegisterServer()
     if (GetModuleFileNameW(g_module, modulePath, MAX_PATH) == 0)
         return HRESULT_FROM_WIN32(GetLastError());
 
-    wchar_t keyPath[128];
-    swprintf_s(keyPath, L"Software\\Classes\\CLSID\\%s", kVCamClsidString);
+    LSTATUS overallStatus = ERROR_SUCCESS;
 
-    HKEY key = nullptr;
-    LSTATUS status = RegCreateKeyExW(HKEY_LOCAL_MACHINE, keyPath, 0, nullptr, 0,
-                                     KEY_WRITE, nullptr, &key, nullptr);
-    if (status != ERROR_SUCCESS)
-        return HRESULT_FROM_WIN32(status);
-
-    const wchar_t description[] = L"PS3 Eye Virtual Camera Media Source";
-    RegSetValueExW(key, nullptr, 0, REG_SZ,
-                   reinterpret_cast<const BYTE*>(description), sizeof(description));
-
-    HKEY inproc = nullptr;
-    status = RegCreateKeyExW(key, L"InprocServer32", 0, nullptr, 0,
-                             KEY_WRITE, nullptr, &inproc, nullptr);
-    if (status == ERROR_SUCCESS)
+    for (int i = 0; i < kVCamCount; ++i)
     {
-        RegSetValueExW(inproc, nullptr, 0, REG_SZ,
-                       reinterpret_cast<const BYTE*>(modulePath),
-                       static_cast<DWORD>((wcslen(modulePath) + 1) * sizeof(wchar_t)));
-        const wchar_t threading[] = L"Both";
-        RegSetValueExW(inproc, L"ThreadingModel", 0, REG_SZ,
-                       reinterpret_cast<const BYTE*>(threading), sizeof(threading));
-        RegCloseKey(inproc);
+        wchar_t keyPath[128];
+        swprintf_s(keyPath, L"Software\\Classes\\CLSID\\%s", kVCamClsidStrings[i]);
+
+        HKEY key = nullptr;
+        LSTATUS status = RegCreateKeyExW(HKEY_LOCAL_MACHINE, keyPath, 0, nullptr, 0,
+                                         KEY_WRITE, nullptr, &key, nullptr);
+        if (status != ERROR_SUCCESS)
+        {
+            overallStatus = status;
+            continue;
+        }
+
+        wchar_t description[128];
+        swprintf_s(description, L"PS3 Eye Virtual Camera Media Source #%d", i);
+        RegSetValueExW(key, nullptr, 0, REG_SZ,
+                       reinterpret_cast<const BYTE*>(description),
+                       static_cast<DWORD>((wcslen(description) + 1) * sizeof(wchar_t)));
+
+        HKEY inproc = nullptr;
+        status = RegCreateKeyExW(key, L"InprocServer32", 0, nullptr, 0,
+                                 KEY_WRITE, nullptr, &inproc, nullptr);
+        if (status == ERROR_SUCCESS)
+        {
+            RegSetValueExW(inproc, nullptr, 0, REG_SZ,
+                           reinterpret_cast<const BYTE*>(modulePath),
+                           static_cast<DWORD>((wcslen(modulePath) + 1) * sizeof(wchar_t)));
+            const wchar_t threading[] = L"Both";
+            RegSetValueExW(inproc, L"ThreadingModel", 0, REG_SZ,
+                           reinterpret_cast<const BYTE*>(threading), sizeof(threading));
+            RegCloseKey(inproc);
+        }
+        else
+        {
+            overallStatus = status;
+        }
+        RegCloseKey(key);
     }
-    RegCloseKey(key);
-    return status == ERROR_SUCCESS ? S_OK : HRESULT_FROM_WIN32(status);
+    return overallStatus == ERROR_SUCCESS ? S_OK : HRESULT_FROM_WIN32(overallStatus);
 }
 
 STDAPI DllUnregisterServer()
 {
-    wchar_t keyPath[128];
-    swprintf_s(keyPath, L"Software\\Classes\\CLSID\\%s\\InprocServer32", kVCamClsidString);
-    RegDeleteKeyW(HKEY_LOCAL_MACHINE, keyPath);
-    swprintf_s(keyPath, L"Software\\Classes\\CLSID\\%s", kVCamClsidString);
-    RegDeleteKeyW(HKEY_LOCAL_MACHINE, keyPath);
+    // RegDeleteTreeW removes the whole CLSID node regardless of what subkeys
+    // a given build version created — no dangling InprocServer32 paths for
+    // the Frame Server to trip over after an uninstall.
+    for (int i = 0; i < kVCamCount; ++i)
+    {
+        wchar_t keyPath[128];
+        swprintf_s(keyPath, L"Software\\Classes\\CLSID\\%s", kVCamClsidStrings[i]);
+        RegDeleteTreeW(HKEY_LOCAL_MACHINE, keyPath);
+    }
     return S_OK;
 }

@@ -4,35 +4,56 @@
 // First icon in the file is what Explorer shows for the exe.
 IDI_APP ICON "PS3EyeVCam.ico"
 
-IDD_SETTINGS DIALOGEX 0, 0, 232, 198
+IDD_SETTINGS DIALOGEX 0, 0, 232, 290
 STYLE DS_SETFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
 EXSTYLE WS_EX_APPWINDOW
 CAPTION "PS3 Eye Camera"
 FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
-    LTEXT           "Video mode:", -1, 12, 13, 56, 10
-    COMBOBOX        IDC_MODECOMBO, 72, 11, 148, 140,
+    LTEXT           "Camera:", -1, 12, 13, 52, 10
+    COMBOBOX        IDC_CAMCOMBO, 72, 11, 148, 140,
                     CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
 
-    AUTOCHECKBOX    "Flip &horizontally", IDC_FLIPH, 12, 33, 100, 10
-    AUTOCHECKBOX    "Flip &vertically", IDC_FLIPV, 122, 33, 98, 10
-    AUTOCHECKBOX    "Auto &white balance", IDC_AWB, 12, 49, 120, 10
-    AUTOCHECKBOX    "&Auto gain && exposure", IDC_AUTOGAIN, 12, 65, 130, 10
+    LTEXT           "Video mode:", -1, 12, 29, 52, 10
+    COMBOBOX        IDC_MODECOMBO, 72, 27, 148, 140,
+                    CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
 
-    LTEXT           "Gain:", -1, 12, 86, 52, 10
+    AUTOCHECKBOX    "Flip &horizontally", IDC_FLIPH, 12, 45, 96, 10
+    AUTOCHECKBOX    "Flip &vertically", IDC_FLIPV, 122, 45, 96, 10
+    AUTOCHECKBOX    "Auto &white balance", IDC_AWB, 12, 59, 96, 10
+    AUTOCHECKBOX    "&Auto gain / exposure", IDC_AUTOGAIN, 122, 59, 96, 10
+    AUTOCHECKBOX    "Test Pattern", IDC_TESTPATTERN, 12, 73, 96, 10
+
+    LTEXT           "Gain:", -1, 12, 92, 52, 10
     CONTROL         "", IDC_GAIN_SLIDER, "msctls_trackbar32",
-                    TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, 66, 83, 128, 16
-    CTEXT           "0", IDC_GAIN_LABEL, 198, 86, 24, 10
+                    TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, 66, 89, 128, 16
+    CTEXT           "0", IDC_GAIN_LABEL, 198, 92, 24, 10
 
-    LTEXT           "Exposure:", -1, 12, 106, 52, 10
+    LTEXT           "Exposure:", -1, 12, 112, 52, 10
     CONTROL         "", IDC_EXPOSURE_SLIDER, "msctls_trackbar32",
-                    TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, 66, 103, 128, 16
-    CTEXT           "0", IDC_EXPOSURE_LABEL, 198, 106, 24, 10
+                    TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, 66, 109, 128, 16
+    CTEXT           "0", IDC_EXPOSURE_LABEL, 198, 112, 24, 10
 
-    AUTOCHECKBOX    "&Start with Windows", IDC_AUTOSTART, 12, 128, 120, 10
+    LTEXT           "Red gain:", -1, 12, 132, 52, 10
+    CONTROL         "", IDC_RED_SLIDER, "msctls_trackbar32",
+                    TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, 66, 129, 128, 16
+    CTEXT           "0", IDC_RED_LABEL, 198, 132, 24, 10
 
-    LTEXT           "", IDC_STATUS_TEXT, 12, 150, 208, 20
-    DEFPUSHBUTTON   "Close", IDOK, 170, 176, 50, 14
+    LTEXT           "Blue gain:", -1, 12, 152, 52, 10
+    CONTROL         "", IDC_BLUE_SLIDER, "msctls_trackbar32",
+                    TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, 66, 149, 128, 16
+    CTEXT           "0", IDC_BLUE_LABEL, 198, 152, 24, 10
+
+    LTEXT           "Green gain:", -1, 12, 172, 52, 10
+    CONTROL         "", IDC_GREEN_SLIDER, "msctls_trackbar32",
+                    TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, 66, 169, 128, 16
+    CTEXT           "0", IDC_GREEN_LABEL, 198, 172, 24, 10
+
+    AUTOCHECKBOX    "&Start with Windows", IDC_AUTOSTART, 12, 195, 120, 10
+
+    LTEXT           "", IDC_STATUS_TEXT, 12, 216, 208, 30
+    PUSHBUTTON      "Reset &defaults", IDC_RESET, 12, 268, 72, 14
+    DEFPUSHBUTTON   "Close", IDOK, 170, 268, 50, 14
 END
 
 VS_VERSION_INFO VERSIONINFO

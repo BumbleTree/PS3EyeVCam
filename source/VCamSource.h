@@ -4,8 +4,9 @@
 // virtual camera (MFCreateVirtualCamera) pipeline.
 //
 // These objects are instantiated inside the Camera Frame Server service, not
-// in the host app. They read NV12 frames from the FrameBus shared-memory
-// section published by PS3EyeVCamHost.exe.
+// in the host app. They read YUY2 frames from the FrameBus shared-memory
+// section published by PS3EyeVCamHost.exe and deliver them as-is to YUY2
+// clients or converted to NV12 on the fly.
 //
 // Built against SDK 10.0.19041: every interface used here (IMFMediaSourceEx,
 // IMFMediaStream2, the MF_DEVICESTREAM_* attributes) exists in that SDK; only
@@ -22,6 +23,7 @@
 #include "../common/FrameBus.h"
 #include "../common/ControlBus.h"
 #include "../common/Settings.h"
+#include <atomic>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -88,7 +90,7 @@ class MediaSource;
 class MediaStream final : public IMFMediaStream2, public IKsControl
 {
 public:
-    explicit MediaStream(MediaSource* parent);
+    MediaStream(MediaSource* parent, int cameraIndex);
     virtual ~MediaStream() = default;
 
     HRESULT Initialize();
@@ -135,6 +137,10 @@ private:
 
     LONG    _refCount = 1;
     CritSec _lock;
+    // Serializes DeliverSample (sole owner of the staging buffers while a
+    // delivery is in flight). Ordering rule: _deliverLock is acquired BEFORE
+    // _lock, never the other way around.
+    CritSec _deliverLock;
 
     MediaSource*               _parent;       // weak during construction...
     ComPtr<IMFMediaSource>     _parentRef;    // ...strong once initialized; dropped at Shutdown
@@ -153,15 +159,19 @@ private:
 
     framebus::Reader           _bus;
     ULONGLONG                  _nextBusRetryTick = 0;
-    LONG64                     _lastFrameId = 0;
-    std::unique_ptr<uint8_t[]> _staging;   // last good frame (starts black)
-    std::unique_ptr<uint8_t[]> _busStaging; // temp buffer for reading raw frames from the bus
+    std::atomic<LONG64>        _lastFrameId{ 0 };
+    // Last good frame (starts black). shared_ptr: Start() may swap in a new
+    // buffer (format renegotiation) while DeliverSample still copies from its
+    // snapshot of the old one; shared ownership keeps that buffer alive.
+    std::shared_ptr<uint8_t[]> _staging;
+    std::unique_ptr<uint8_t[]> _busStaging; // bus-sized scratch, allocated once, guarded by _deliverLock
 
     // Sleep/wake keepalive towards the host. Closed by the destructor, not by
     // Shutdown (same in-flight-call rationale as _bus).
     controlbus::Pinger _ping;
     ULONGLONG          _nextPingRetryTick = 0;
     ULONGLONG          _lastWakeSignalTick = 0;
+    int                _cameraIndex = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -170,7 +180,7 @@ private:
 class MediaSource final : public IMFMediaSourceEx, public IMFGetService, public IKsControl
 {
 public:
-    MediaSource();
+    explicit MediaSource(int cameraIndex);
     virtual ~MediaSource() = default;
 
     HRESULT Initialize(IMFAttributes* activationAttributes);
@@ -227,4 +237,5 @@ private:
     ComPtr<IMFAttributes>              _attributes;
     ComPtr<MediaStream>                _stream;
     ComPtr<IMFPresentationDescriptor>  _pd;
+    int                                _cameraIndex = 0;
 };

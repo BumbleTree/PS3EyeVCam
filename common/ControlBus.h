@@ -17,11 +17,10 @@
 #include <windows.h>
 #include <sddl.h>
 #include <cstdint>
+#include "IpcNames.h"
 
 namespace controlbus {
 
-constexpr const wchar_t* kSectionName   = L"Global\\PS3EyeVCam.Control";
-constexpr const wchar_t* kWakeEventName = L"Global\\PS3EyeVCam.Wake";
 constexpr const wchar_t* kSddl = L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)";
 
 constexpr uint32_t kMagic   = 0x50334543;  // 'P3EC'
@@ -43,17 +42,22 @@ class Host
 public:
     ~Host() { Close(); }
 
-    bool Create()
+    bool Create(int cameraIndex)
     {
+        wchar_t sectionName[64];
+        wchar_t wakeEventName[64];
+        ipcnames::Format(sectionName, L".Control", cameraIndex);
+        ipcnames::Format(wakeEventName, L".Wake", cameraIndex);
+
         SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, FALSE };
         if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 kSddl, SDDL_REVISION_1, &sa.lpSecurityDescriptor, nullptr))
             return false;
 
         _map = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE,
-                                  0, sizeof(Header), kSectionName);
+                                  0, sizeof(Header), sectionName);
         if (_map)
-            _wake = CreateEventW(&sa, FALSE /*auto-reset*/, FALSE, kWakeEventName);
+            _wake = CreateEventW(&sa, FALSE /*auto-reset*/, FALSE, wakeEventName);
         LocalFree(sa.lpSecurityDescriptor);
         if (!_map || !_wake) { Close(); return false; }
 
@@ -104,11 +108,16 @@ public:
 
     bool IsOpen() const { return _view != nullptr; }
 
-    bool TryOpen()
+    bool TryOpen(int cameraIndex)
     {
         if (_view)
             return true;
-        _map = OpenFileMappingW(FILE_MAP_WRITE | FILE_MAP_READ, FALSE, kSectionName);
+        wchar_t sectionName[64];
+        wchar_t wakeEventName[64];
+        ipcnames::Format(sectionName, L".Control", cameraIndex);
+        ipcnames::Format(wakeEventName, L".Wake", cameraIndex);
+
+        _map = OpenFileMappingW(FILE_MAP_WRITE | FILE_MAP_READ, FALSE, sectionName);
         if (!_map)
             return false;
         _view = static_cast<Header*>(MapViewOfFile(_map, FILE_MAP_WRITE | FILE_MAP_READ, 0, 0, 0));
@@ -117,7 +126,16 @@ public:
             Close();
             return false;
         }
-        _wake = OpenEventW(EVENT_MODIFY_STATE, FALSE, kWakeEventName);
+        // Without the wake event a sleeping host (waiting INFINITE on it)
+        // would never see this client: a keepalive stamp alone is not enough.
+        // The host creates the event together with the section, so a missing
+        // event means "host not ready" — fail the open and retry later.
+        _wake = OpenEventW(EVENT_MODIFY_STATE, FALSE, wakeEventName);
+        if (!_wake)
+        {
+            Close();
+            return false;
+        }
         return true;
     }
 

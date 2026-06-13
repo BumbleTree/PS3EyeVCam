@@ -21,6 +21,7 @@
 #include "SettingsDialog.h"
 #include "Autostart.h"
 #include "../common/Settings.h"
+#include "../common/VCamGuids.h"
 
 namespace
 {
@@ -43,7 +44,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     // ---- one-shot installer verbs -------------------------------------------
     if (HasArg(argc, argv, L"--seed-defaults"))
     {
-        settings::SeedDefaults();
+        for (int i = 0; i < kVCamCount; ++i)
+            settings::SeedDefaults(i);
         return 0;
     }
     if (HasArg(argc, argv, L"--enable-autostart") || HasArg(argc, argv, L"--disable-autostart"))
@@ -77,21 +79,29 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_BAR_CLASSES | ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&icc);
 
-    settings::SeedDefaults();  // first run on a clean machine self-initializes
+    for (int i = 0; i < kVCamCount; ++i)
+        settings::SeedDefaults(i);  // first run on a clean machine self-initializes
 
-    CaptureController controller;
+    CaptureController controllers[kVCamCount];
     TrayUI tray;
     settingsdialog::SetTray(&tray);
 
-    if (!tray.Create(instance, &controller))
+    if (!tray.Create(instance, controllers))
     {
         MessageBoxW(nullptr, L"Failed to create the tray window.", L"PS3 Eye Camera",
                     MB_ICONERROR | MB_OK);
         return 1;
     }
-    if (!controller.Start(tray.Hwnd(), TrayUI::WM_CONTROLLER_STATE))
+
+    bool anyStarted = false;
+    for (int i = 0; i < kVCamCount; ++i)
     {
-        MessageBoxW(nullptr, L"Failed to start the camera thread.", L"PS3 Eye Camera",
+        if (controllers[i].Start(i, tray.Hwnd(), TrayUI::WM_CONTROLLER_STATE))
+            anyStarted = true;
+    }
+    if (!anyStarted)
+    {
+        MessageBoxW(nullptr, L"Failed to start the camera threads.", L"PS3 Eye Camera",
                     MB_ICONERROR | MB_OK);
         tray.Destroy();
         return 1;
@@ -106,10 +116,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         DispatchMessageW(&msg);
     }
 
-    // ---- ordered shutdown: UI gone first, then the camera thread -------------
+    // ---- ordered shutdown: UI gone first, then the camera threads -------------
     settingsdialog::Close();
     tray.Destroy();
-    controller.Stop();   // joins; tears down vcam -> camera -> shared memory
+    for (int i = 0; i < kVCamCount; ++i)
+    {
+        controllers[i].Stop();   // joins; tears down vcam -> camera -> shared memory
+    }
     CoUninitialize();
     if (mutex)
         CloseHandle(mutex);
