@@ -11,7 +11,10 @@ if errorlevel 1 (
 )
 
 set "ROOT=%~dp0"
-set "DS=%ROOT%..\PS3EyeDirectShow"
+rem libusb is vendored in-repo (third_party/libusb): prebuilt 1.0.27 static /MT x64,
+rem header in include/. See third_party/libusb/README.md. No external repo needed.
+set "LIBUSB_INC=%ROOT%third_party\libusb\include"
+set "LIBUSB_LIB=%ROOT%third_party\libusb\lib\x64\libusb-1.0.lib"
 set "OUT=%ROOT%build"
 if not exist "%OUT%" mkdir "%OUT%"
 
@@ -21,7 +24,7 @@ rem as Windows-1252 and the tooltips show mojibake.
 set CFLAGS=/nologo /c /O2 /MT /EHsc /std:c++17 /utf-8 /W3 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS
 
 echo === compiling vendored PS3EYEDriver ===
-cl %CFLAGS% /I "%DS%\libusb\libusb" "%ROOT%third_party\ps3eye\ps3eye.cpp" /Fo"%OUT%\ps3eye.obj"
+cl %CFLAGS% /I "%LIBUSB_INC%" "%ROOT%third_party\ps3eye\ps3eye.cpp" /Fo"%OUT%\ps3eye.obj"
 if errorlevel 1 exit /b 1
 
 echo === compiling PS3EyeVCam.dll ===
@@ -40,7 +43,7 @@ rc /nologo /fo "%OUT%\app.res" "%ROOT%res\app.rc"
 if errorlevel 1 exit /b 1
 
 echo === compiling PS3EyeVCamTray.exe ===
-set HOSTFLAGS=%CFLAGS% /I "%ROOT%third_party\ps3eye" /I "%DS%\libusb\libusb"
+set HOSTFLAGS=%CFLAGS% /I "%ROOT%third_party\ps3eye" /I "%LIBUSB_INC%"
 cl %HOSTFLAGS% "%ROOT%host\Main.cpp"                /Fo"%OUT%\Main.obj"                || exit /b 1
 cl %HOSTFLAGS% "%ROOT%host\CaptureController.cpp"   /Fo"%OUT%\CaptureController.obj"   || exit /b 1
 cl %HOSTFLAGS% "%ROOT%host\TrayUI.cpp"              /Fo"%OUT%\TrayUI.obj"              || exit /b 1
@@ -50,12 +53,14 @@ cl %HOSTFLAGS% "%ROOT%host\Ps3EyePreviewSource.cpp" /Fo"%OUT%\Ps3EyePreviewSourc
 cl %HOSTFLAGS% "%ROOT%host\Autostart.cpp"           /Fo"%OUT%\Autostart.obj"           || exit /b 1
 cl %HOSTFLAGS% "%ROOT%common\Settings.cpp"          /Fo"%OUT%\Settings.obj"            || exit /b 1
 
-link /nologo /SUBSYSTEM:WINDOWS /OUT:"%OUT%\PS3EyeVCamTray.exe" ^
+rem /LTCG: the vendored libusb is built with whole-program optimization (/GL);
+rem stating /LTCG here avoids the linker's automatic "restarting link" pass.
+link /nologo /LTCG /SUBSYSTEM:WINDOWS /OUT:"%OUT%\PS3EyeVCamTray.exe" ^
     "%OUT%\Main.obj" "%OUT%\CaptureController.obj" "%OUT%\TrayUI.obj" ^
     "%OUT%\SettingsDialog.obj" "%OUT%\CameraPreview.obj" "%OUT%\Ps3EyePreviewSource.obj" ^
     "%OUT%\Autostart.obj" "%OUT%\Settings.obj" ^
     "%OUT%\ps3eye.obj" "%OUT%\app.res" ^
-    "%DS%\libusb\x64\Release\lib\libusb-1.0.lib" ^
+    "%LIBUSB_LIB%" ^
     mfplat.lib mfuuid.lib ole32.lib oleaut32.lib advapi32.lib setupapi.lib ^
     user32.lib gdi32.lib shell32.lib comctl32.lib secur32.lib taskschd.lib uuid.lib ^
     /MANIFEST:EMBED /MANIFESTINPUT:"%ROOT%res\app.manifest" /MANIFESTUAC:NO
