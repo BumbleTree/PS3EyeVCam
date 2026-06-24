@@ -1,6 +1,6 @@
 #pragma once
 //
-// "Start with Windows" via a Task Scheduler logon task (\PS3EyeVCam).
+// "Start with Windows" via a Task Scheduler logon task (\PSCam4Win).
 //
 // Why a scheduled task and not Run-key/Startup-folder: the app must launch
 // ELEVATED with no UAC prompt. A logon task with RunLevel=Highest, created by

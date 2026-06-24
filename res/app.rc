@@ -2,12 +2,12 @@
 #include "resource.h"
 
 // First icon in the file is what Explorer shows for the exe.
-IDI_APP ICON "PS3EyeVCam.ico"
+IDI_APP ICON "PSCam4Win.ico"
 
-IDD_SETTINGS DIALOGEX 0, 0, 460, 290
+IDD_SETTINGS DIALOGEX 0, 0, 460, 326
 STYLE DS_SETFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
 EXSTYLE WS_EX_APPWINDOW
-CAPTION "PS3 Eye Camera"
+CAPTION "PSCam4Win"
 FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
     LTEXT           "Camera:", -1, 12, 13, 52, 10
@@ -49,20 +49,30 @@ BEGIN
                     TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, 66, 169, 128, 16
     CTEXT           "0", IDC_GREEN_LABEL, 198, 172, 24, 10
 
-    AUTOCHECKBOX    "&Start with Windows", IDC_AUTOSTART, 12, 195, 120, 10
+    LTEXT           "Brightness:", -1, 12, 192, 52, 10
+    CONTROL         "", IDC_BRIGHTNESS_SLIDER, "msctls_trackbar32",
+                    TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, 66, 189, 128, 16
+    CTEXT           "0", IDC_BRIGHTNESS_LABEL, 198, 192, 24, 10
 
-    LTEXT           "", IDC_STATUS_TEXT, 12, 216, 436, 30
+    LTEXT           "Saturation:", -1, 12, 212, 52, 10
+    CONTROL         "", IDC_SATURATION_SLIDER, "msctls_trackbar32",
+                    TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, 66, 209, 128, 16
+    CTEXT           "0", IDC_SATURATION_LABEL, 198, 212, 24, 10
+
+    AUTOCHECKBOX    "&Start with Windows", IDC_AUTOSTART, 12, 231, 120, 10
+
+    LTEXT           "", IDC_STATUS_TEXT, 12, 252, 436, 30
 
     CONTROL         "", IDC_PREVIEW, "Static", SS_SUNKEN | WS_CHILD | WS_VISIBLE,
-                    240, 11, 208, 157
+                    240, 11, 208, 160
 
-    PUSHBUTTON      "Reset &defaults", IDC_RESET, 12, 268, 72, 14
-    DEFPUSHBUTTON   "Close", IDOK, 398, 268, 50, 14
+    PUSHBUTTON      "Reset &defaults", IDC_RESET, 12, 304, 72, 14
+    DEFPUSHBUTTON   "Close", IDOK, 398, 304, 50, 14
 END
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION    1,0,0,0
- PRODUCTVERSION 1,0,0,0
+ FILEVERSION    3,0,0,0
+ PRODUCTVERSION 3,0,0,0
  FILEFLAGSMASK  0x3fL
  FILEFLAGS      0x0L
  FILEOS         VOS_NT_WINDOWS32
@@ -73,13 +83,13 @@ BEGIN
     BEGIN
         BLOCK "040904b0"
         BEGIN
-            VALUE "CompanyName",      "PS3EyeVCam"
-            VALUE "FileDescription",  "PS3 Eye Virtual Camera"
-            VALUE "FileVersion",      "1.0.0.0"
-            VALUE "InternalName",     "PS3EyeVCamTray"
-            VALUE "OriginalFilename", "PS3EyeVCamTray.exe"
-            VALUE "ProductName",      "PS3 Eye Virtual Camera"
-            VALUE "ProductVersion",   "1.0.0.0"
+            VALUE "CompanyName",      "PSCam4Win"
+            VALUE "FileDescription",  "PSCam4Win Virtual Camera"
+            VALUE "FileVersion",      "3.0.0.0"
+            VALUE "InternalName",     "PSCam4WinTray"
+            VALUE "OriginalFilename", "PSCam4WinTray.exe"
+            VALUE "ProductName",      "PSCam4Win Virtual Camera"
+            VALUE "ProductVersion",   "3.0.0.0"
         END
     END
     BLOCK "VarFileInfo"

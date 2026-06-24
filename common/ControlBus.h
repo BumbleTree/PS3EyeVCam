@@ -24,7 +24,20 @@ namespace controlbus {
 constexpr const wchar_t* kSddl = L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)";
 
 constexpr uint32_t kMagic   = 0x50334543;  // 'P3EC'
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 2;
+
+// Which pixel format(s) the active MF client negotiated. The DLL knows the
+// negotiated subtype only inside MediaStream::Start, so it publishes these bits
+// here (the FrameBus is read-only to the DLL); the host reads them to gate
+// optional per-frame work, e.g. filling the JPEG sidecar only for an MJPEG
+// client. Values match host FormatBits (ICameraDevice.h) and FrameBus
+// formatMask so a mask bit means the same thing across all three.
+enum ConsumerFormat : uint32_t
+{
+    kConsumeYUY2  = 1u,
+    kConsumeNV12  = 2u,
+    kConsumeMJPEG = 4u,
+};
 
 #pragma pack(push, 8)
 struct Header
@@ -32,6 +45,8 @@ struct Header
     uint32_t magic;
     uint32_t version;
     volatile LONG64 lastActivityTick;  // GetTickCount64() of last client activity
+    volatile uint32_t consumerMask;    // ConsumerFormat bits; 0 = no active client
+    uint32_t pad0;
 };
 #pragma pack(pop)
 
@@ -66,6 +81,7 @@ public:
 
         _view->version = kVersion;
         _view->lastActivityTick = 0;
+        _view->consumerMask = 0;
         MemoryBarrier();
         _view->magic = kMagic;
         return true;
@@ -79,6 +95,13 @@ public:
             return MAXULONGLONG;
         const ULONGLONG now = GetTickCount64();
         return now > static_cast<ULONGLONG>(tick) ? now - static_cast<ULONGLONG>(tick) : 0;
+    }
+
+    // ConsumerFormat bits the active client negotiated (0 = none). Plain aligned
+    // 32-bit load (atomic on x64). The host uses this to decide wantJpeg etc.
+    uint32_t ConsumerMask() const
+    {
+        return _view ? _view->consumerMask : 0;
     }
 
     HANDLE WakeEvent() const { return _wake; }
@@ -146,6 +169,14 @@ public:
         if (_view)
             WriteRelease64(&_view->lastActivityTick,
                            static_cast<LONG64>(GetTickCount64()));
+    }
+
+    // Publish which pixel format(s) the active client negotiated. Plain aligned
+    // 32-bit store (atomic on x64). Pass 0 to clear it when no client is active.
+    void SetConsumerMask(uint32_t mask)
+    {
+        if (_view)
+            _view->consumerMask = mask;
     }
 
     void SignalWake()

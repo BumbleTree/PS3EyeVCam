@@ -6,7 +6,8 @@
 #include <cstdarg>
 #include <memory>
 
-#include "ps3eye.h"
+#include "ICameraDevice.h"
+#include "DeviceRegistry.h"
 #include "mfvirtualcamera_min.h"
 #include "../common/FrameBus.h"
 #include "../common/ControlBus.h"
@@ -24,14 +25,12 @@ void HostLog(const wchar_t* fmt, ...)
     if (GetConsoleWindow())
         wprintf(L"%s\n", buf);
     wchar_t line[560];
-    _snwprintf_s(line, _TRUNCATE, L"PS3EyeVCamTray: %s\n", buf);
+    _snwprintf_s(line, _TRUNCATE, L"PSCam4WinTray: %s\n", buf);
     OutputDebugStringW(line);
 }
 
 namespace
 {
-
-static SRWLOCK g_devicesLock = SRWLOCK_INIT;
 
 // MFCreateVirtualCamera lives in mfsensorgroup.dll (Windows 11 22000+).
 // Resolved once for the whole process; the module is never freed (its
@@ -47,32 +46,6 @@ PFN_MFCreateVirtualCamera GetMFCreateVirtualCamera()
     return fn;
 }
 
-// Push every sensor-level setting to the camera (order-safe live or pre-start).
-void ApplySensorSettings(const ps3eye::PS3EYECam::PS3EYERef& eye, const Settings& s)
-{
-    eye->setFlip(s.flipH, s.flipV);
-    eye->setAutoWhiteBalance(s.autoWhiteBalance);
-    if (s.autoGain)
-    {
-        eye->setAutogain(true);
-    }
-    else
-    {
-        eye->setAutogain(false);  // also re-applies cached gain/exposure
-        eye->setGain(static_cast<uint8_t>(s.gain));
-        eye->setExposure(static_cast<uint8_t>(s.exposure));
-    }
-
-    if (!s.autoWhiteBalance)
-    {
-        eye->setRedBalance(static_cast<uint8_t>(s.redBalance));
-        eye->setBlueBalance(static_cast<uint8_t>(s.blueBalance));
-        eye->setGreenBalance(static_cast<uint8_t>(s.greenBalance));
-    }
-
-    eye->setTestPattern(s.testPattern);
-}
-
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -85,6 +58,21 @@ bool CaptureController::Start(int cameraIndex, HWND notifyWnd, UINT notifyMsg)
     {
         AcquireSRWLockExclusive(&_settingsLock);
         _desired = settings::Load(_cameraIndex);
+        // Device-aware initial mode: if a recognised camera occupies this slot
+        // and the persisted mode isn't one it can serve, fall back to that
+        // device's default mode (e.g. an EyeToy slot persisted with the PS3's
+        // 640x480@60 default). No-op for the PS3 Eye (its default mode is one of
+        // its own modes) and for empty slots (no profile), so the PS3 path and
+        // slot↔mode mapping are unchanged.
+        if (const DeviceProfile* prof = deviceregistry::ProfileForSlot(_cameraIndex))
+        {
+            if (!ProfileHasMode(*prof, _desired.width, _desired.height, _desired.fps))
+            {
+                _desired.width  = prof->defaultMode.width;
+                _desired.height = prof->defaultMode.height;
+                _desired.fps    = prof->defaultMode.fps;
+            }
+        }
         _active = _desired;
         ReleaseSRWLockExclusive(&_settingsLock);
     }
@@ -179,6 +167,11 @@ void CaptureController::Run()
     }
     bus.PublishBlack();
 
+    // Publish the slot's device capabilities (modes / formats / default) before
+    // any virtual-camera registration, so the DLL always has a capability block
+    // to build its media types from (TDD §8.3).
+    deviceregistry::PublishColdBlock(bus, _cameraIndex);
+
     controlbus::Host control;
     if (!control.Create(_cameraIndex))
     {
@@ -201,10 +194,16 @@ void CaptureController::Run()
         if (vcamLive || !createVCam || GetTickCount64() < vcamRetryDue)
             return;
         ++vcamAttempts;
+        // The virtual camera advertises the name of the device that currently
+        // occupies the slot ("PS3 Eye" / "PS2 EyeToy"), numbered only when more
+        // than one camera of that type is present, so a lone EyeToy is just
+        // "PS2 EyeToy" rather than "PS2 EyeToy #7".
+        wchar_t friendlyName[64];
+        deviceregistry::SlotDisplayName(_cameraIndex, friendlyName, 64);
         HRESULT hr = createVCam(MFVirtualCameraType_SoftwareCameraSource,
                                 MFVirtualCameraLifetime_Session,
                                 MFVirtualCameraAccess_CurrentUser,
-                                kVCamFriendlyNames[_cameraIndex], kVCamClsidStrings[_cameraIndex], nullptr, 0, &vcam);
+                                friendlyName, kVCamClsidStrings[_cameraIndex], nullptr, 0, &vcam);
         if (SUCCEEDED(hr))
             hr = vcam->Start(nullptr);
         if (SUCCEEDED(hr))
@@ -248,11 +247,10 @@ void CaptureController::Run()
     }
 
     // ---- camera state ------------------------------------------------------
-    ps3eye::PS3EYECam::PS3EYERef eye;
-
-    // getFrame writes publish-ready YUY2 straight into this buffer (the
-    // Bayer->YUY2 debayer is fused inside the driver; no RGB intermediate).
-    std::unique_ptr<uint8_t[]> yuy2(new uint8_t[framebus::kMaxFrameBytes]);
+    // The active device for this slot (PS3 Eye today). Built by the registry on
+    // wake, destroyed on sleep. AcquireFrame returns device-owned YUY2; the
+    // fused Bayer->YUY2 debayer lives inside the device, no RGB intermediate.
+    std::unique_ptr<ICameraDevice> device;
 
     // True while either (a) an external app is consuming frames (ControlBus
     // keepalive fresh) or (b) the Settings dialog preview is open for this
@@ -264,29 +262,47 @@ void CaptureController::Run()
         return ext || _previewHold.load(std::memory_order_relaxed);
     };
 
-    // True while a physical PS3 Eye occupies this slot. Refreshes the global
-    // slot map (cheap libusb descriptor walk; only runs while not streaming).
-    auto slotOccupied = [&]() -> bool {
-        AcquireSRWLockExclusive(&g_devicesLock);
-        const auto& devices = ps3eye::PS3EYECam::getDevices(true);
-        const bool present = devices.size() > static_cast<size_t>(_cameraIndex) &&
-                             devices[_cameraIndex] != nullptr;
-        ReleaseSRWLockExclusive(&g_devicesLock);
-        return present;
+    // Re-sync the slot's advertised capabilities (and the active mode) with the
+    // device that currently occupies it. Cold path: only ever called while
+    // Asleep (the camera is released), so rewriting the bus format and active
+    // mode here cannot disturb a live stream. Covers a camera hot-plugged into a
+    // slot that was empty — or held a different device — when Run() first
+    // published the ColdBlock, including the logon race where the USB stack had
+    // not finished enumerating the camera by the time Run() started.
+    auto readvertiseSlot = [&](const DeviceProfile* prof) {
+        // If the active/persisted mode isn't one this device can serve (e.g. an
+        // EyeToy landing in a slot that defaulted to the PS3's 640x480@60), fall
+        // back to the device's default so Init() gets a valid mode and the bus
+        // header advertises the real geometry.
+        if (!ProfileHasMode(*prof, active.width, active.height, active.fps))
+        {
+            active.width  = prof->defaultMode.width;
+            active.height = prof->defaultMode.height;
+            active.fps    = prof->defaultMode.fps;
+            bus.UpdateFormat(active.width, active.height, active.fps, 1);
+            _pendingMode.store(false, std::memory_order_relaxed);
+            AcquireSRWLockExclusive(&_settingsLock);
+            _active = active;
+            ReleaseSRWLockExclusive(&_settingsLock);
+            HostLog(L"camera %d: re-advertised as %s -> %ux%u@%u", _cameraIndex,
+                    prof->displayName, active.width, active.height, active.fps);
+        }
+        // Republish the capability block from the now-known profile so the DLL
+        // builds its media types from the live device (modes/formats/default
+        // subtype), not whatever occupied the slot when Run() started.
+        deviceregistry::PublishColdBlock(bus, _cameraIndex);
     };
 
     auto releaseCamera = [&]() {
-        if (eye)
+        if (device)
         {
-            eye->stop();      // sensor off, LED off, transfers cancelled, USB interface released
-            eye.reset();
+            device->Stop();   // sensor off, LED off, transfers cancelled, USB released
+            device.reset();
         }
         // Refresh the slot map: drops devices that were unplugged and repairs
-        // slots whose camera was replugged (stale libusb_device swapped for
-        // the live one). The slot keeps the same index throughout.
-        AcquireSRWLockExclusive(&g_devicesLock);
-        ps3eye::PS3EYECam::getDevices(true);
-        ReleaseSRWLockExclusive(&g_devicesLock);
+        // slots whose camera was replugged (stale libusb_device swapped for the
+        // live one). The slot keeps the same index throughout.
+        deviceregistry::Rescan();
         _fpsX10.store(0, std::memory_order_relaxed);
     };
 
@@ -327,7 +343,8 @@ void CaptureController::Run()
             desired.exposure != active.exposure ||
             desired.autoWhiteBalance != active.autoWhiteBalance ||
             desired.redBalance != active.redBalance || desired.blueBalance != active.blueBalance ||
-            desired.greenBalance != active.greenBalance || desired.testPattern != active.testPattern;
+            desired.greenBalance != active.greenBalance || desired.testPattern != active.testPattern ||
+            desired.brightness != active.brightness || desired.saturation != active.saturation;
 
         active.flipH = desired.flipH;       active.flipV = desired.flipV;
         active.autoGain = desired.autoGain; active.gain = desired.gain;
@@ -335,9 +352,10 @@ void CaptureController::Run()
         active.idleTimeoutMs = desired.idleTimeoutMs;
         active.redBalance = desired.redBalance; active.blueBalance = desired.blueBalance;
         active.greenBalance = desired.greenBalance; active.testPattern = desired.testPattern;
+        active.brightness = desired.brightness; active.saturation = desired.saturation;
 
-        if (cameraLive && sensorChanged && eye)
-            ApplySensorSettings(eye, active);
+        if (cameraLive && sensorChanged && device)
+            device->ApplySettings(active);
 
         AcquireSRWLockExclusive(&_settingsLock);
         _active = active;
@@ -356,27 +374,19 @@ void CaptureController::Run()
     // virtual camera, the latter keeps it and retries.
     enum class WakeResult { Ok, SlotEmpty, InitFailed };
     auto wakeCamera = [&]() -> WakeResult {
-        AcquireSRWLockExclusive(&g_devicesLock);
-        const auto& devices = ps3eye::PS3EYECam::getDevices(true);
-        if (devices.size() <= static_cast<size_t>(_cameraIndex) || !devices[_cameraIndex])
-        {
-            ReleaseSRWLockExclusive(&g_devicesLock);
+        device = deviceregistry::Acquire(_cameraIndex);
+        if (!device)
             return WakeResult::SlotEmpty;
-        }
-        eye = devices[_cameraIndex];
-        ReleaseSRWLockExclusive(&g_devicesLock);
-        if (!eye->init(active.width, active.height, static_cast<uint16_t>(active.fps),
-                       ps3eye::PS3EYECam::EOutputFormat::YUY2))
+        const VideoMode mode{ active.width, active.height, active.fps };
+        if (!device->Init(mode))   // releases the USB handle on failure
         {
-            eye->release();   // close the USB handle; don't hold it while idle
-            eye.reset();
+            device.reset();
             return WakeResult::InitFailed;
         }
-        ApplySensorSettings(eye, active);
-        if (!eye->start())
+        device->ApplySettings(active);
+        if (!device->Start())
         {
-            eye->release();
-            eye.reset();
+            device.reset();
             return WakeResult::InitFailed;
         }
         return WakeResult::Ok;
@@ -385,6 +395,11 @@ void CaptureController::Run()
     // ---- state machine ------------------------------------------------------
     enum class Phase { Asleep, Waking, Streaming };
     Phase phase = Phase::Asleep;
+
+    // Device profile last advertised into the ColdBlock for this slot. nullptr
+    // forces the first occupied Asleep pass to (re)advertise, covering a device
+    // that finished USB enumeration after Run() published the start-time block.
+    const DeviceProfile* publishedProfile = nullptr;
 
     int consecutiveTimeouts = 0;
     uint32_t framesInWindow = 0;
@@ -410,7 +425,17 @@ void CaptureController::Run()
             bool present = false;
             if (createVCam)
             {
-                present = slotOccupied();
+                // ProfileForSlot is non-null iff the slot is occupied AND tells us
+                // which device occupies it, in a single enumeration. Re-advertise
+                // whenever the occupant changes (including empty -> present) so the
+                // DLL always builds media types from the live device's profile.
+                const DeviceProfile* prof = deviceregistry::ProfileForSlot(_cameraIndex);
+                present = (prof != nullptr);
+                if (present && prof != publishedProfile)
+                {
+                    publishedProfile = prof;
+                    readvertiseSlot(prof);
+                }
                 if (present && !vcamLive)
                     tryRegisterVCam();
                 else if (!present && vcamLive)
@@ -490,10 +515,21 @@ void CaptureController::Run()
                 stopping = true;
                 break;
             }
-            if (eye->getFrame(yuy2.get(), 500))
+            // The DLL publishes which format the active client negotiated; only
+            // an MJPEG client needs the JFIF sidecar. mask==0 (no/stale client)
+            // -> wantJpeg=false (TDD §5.5). One plain aligned load + branch; the
+            // PS3 path always reports no jpeg and falls through to Publish().
+            const bool wantJpeg =
+                (control.ConsumerMask() & controlbus::kConsumeMJPEG) != 0;
+
+            AcquiredFrame frame{};
+            if (device->AcquireFrame(frame, 500, wantJpeg))
             {
                 consecutiveTimeouts = 0;
-                bus.Publish(yuy2.get(), framebus::Yuy2Bytes(active.width, active.height));
+                if (frame.jpeg && frame.jpegBytes)
+                    bus.PublishWithJpeg(frame.yuy2, frame.yuy2Bytes, frame.jpeg, frame.jpegBytes);
+                else
+                    bus.Publish(frame.yuy2, frame.yuy2Bytes);
 
                 ++framesInWindow;
                 const ULONGLONG now = GetTickCount64();

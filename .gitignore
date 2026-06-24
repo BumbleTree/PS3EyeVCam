@@ -1,6 +1,11 @@
 # Compiled binaries and build artifacts
 build/
 
+# Phase 0 scratch / external reference (not committed)
+_libusb_src/
+_ref/
+tools/fixtures/*.bin
+
 # MSVC compiler intermediate files
 *.obj
 *.pdb
@@ -18,3 +23,9 @@ verify_exit.log
 Thumbs.db
 ehthumbs.db
 Desktop.ini
+
+# Project documentation
+docs/
+
+# Developer tools
+tools/

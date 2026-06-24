@@ -62,6 +62,8 @@ private:
     bool RecreateDib(int width, int height); // worker thread only; false on failure
     void ResizeToAspect();                   // fit the control to the source's aspect ratio
     void Paint(HDC hdc, int w, int h);
+    bool EnsureBackBuffer(HDC ref, int w, int h);  // UI thread only; false on failure
+    void DestroyBackBuffer();                       // UI thread only
 
     // Worker state
     std::unique_ptr<ICameraPreviewSource> _source;  // worker-thread only
@@ -97,4 +99,16 @@ private:
     HBITMAP     _dibOld  = nullptr;
     int         _dibW    = 0;
     int         _dibH    = 0;
+
+    // Off-screen compose buffer for flicker-free painting. Touched only on the
+    // UI thread (Paint/Detach), so it needs no lock — the worker never sees it.
+    // Paint() scales the frame and stamps the badge into this buffer, then
+    // BitBlts it to the window in a single shot; that makes on-screen updates
+    // atomic, so neither the live image nor the "in use" badge flickers. Sized
+    // to the control's client area and rebuilt on resize; torn down in Detach.
+    HDC         _backDc  = nullptr;
+    HBITMAP     _backBmp = nullptr;
+    HBITMAP     _backOld = nullptr;
+    int         _backW   = 0;
+    int         _backH   = 0;
 };

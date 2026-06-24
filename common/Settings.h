@@ -1,6 +1,6 @@
 #pragma once
 //
-// Persistent configuration, stored under HKLM\SOFTWARE\PS3EyeVCam so it is
+// Persistent configuration, stored under HKLM\SOFTWARE\PSCam4Win so it is
 // writable by the (elevated) tray app and readable everywhere. The FrameBus
 // header remains the DLL's source of truth for the active format; the
 // registry is the *host's* source of truth across restarts.
@@ -51,6 +51,12 @@ struct Settings
     uint32_t blueBalance = 128;   // 0..255  -> reg 0x01 AWB blue gain (manual WB)
     uint32_t greenBalance = 128;  // 0..255  -> reg 0x03 AWB green gain (manual WB)
     bool     testPattern = false;
+
+    // EyeToy (OV7648) sensor controls. The PS3 Eye ignores these; the EyeToy
+    // ignores gain/exposure/flip/balance/testPattern (its OV7648 only exposes
+    // brightness/saturation/AWB via the proven gspca ov519 path).
+    uint32_t brightness = 127;    // 0..255  -> OV7648 reg 0x06 (Y brightness)
+    uint32_t saturation = 127;    // 0..255  -> OV7648 reg 0x03 (saturation, hi nibble)
 
     bool SameMode(const Settings& o) const
     {

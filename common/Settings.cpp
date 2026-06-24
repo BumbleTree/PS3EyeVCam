@@ -36,13 +36,13 @@ uint32_t Clamp(uint32_t v, uint32_t lo, uint32_t hi)
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
-// Camera 0 lives at the root key (legacy layout); 1..N-1 in Camera%d subkeys.
+// Camera 0 lives at the root key; 1..N-1 in Camera%d subkeys.
 void FormatSettingsKeyPath(wchar_t (&buf)[128], int cameraIndex)
 {
     if (cameraIndex == 0)
-        swprintf_s(buf, L"SOFTWARE\\PS3EyeVCam");
+        swprintf_s(buf, L"SOFTWARE\\PSCam4Win");
     else
-        swprintf_s(buf, L"SOFTWARE\\PS3EyeVCam\\Camera%d", cameraIndex);
+        swprintf_s(buf, L"SOFTWARE\\PSCam4Win\\Camera%d", cameraIndex);
 }
 
 } // namespace
@@ -90,10 +90,17 @@ Settings Load(int cameraIndex)
     // Legacy Hue key ignored — old builds wrote AWB blue gain (reg 0x01) here.
     ReadBool (key, L"TestPattern",  &s.testPattern);
 
+    ReadDword(key, L"Brightness",   &s.brightness);
+    ReadDword(key, L"Saturation",   &s.saturation);
+
     RegCloseKey(key);
 
-    // Sanitize: unknown mode -> default; ranges clamped.
-    if (FindModeIndex(s.width, s.height, s.fps) < 0)
+    // Sanitize geometry. Reset only obviously-invalid values: a mode that is
+    // simply not in the PS3 table (e.g. the EyeToy's 320x240@15) is left intact
+    // and validated/clamped by the device-aware layer (CaptureController::Start
+    // and the Settings dialog), so per-device modes persist correctly.
+    if (s.width == 0 || s.height == 0 || s.fps == 0 ||
+        s.width > 1920 || s.height > 1080 || s.fps > 240)
     {
         const VideoMode& def = kVideoModes[kDefaultModeIndex];
         s.width = def.width; s.height = def.height; s.fps = def.fps;
@@ -104,6 +111,8 @@ Settings Load(int cameraIndex)
     s.redBalance = Clamp(s.redBalance, 0, 255);
     s.blueBalance = Clamp(s.blueBalance, 0, 255);
     s.greenBalance = Clamp(s.greenBalance, 0, 255);
+    s.brightness = Clamp(s.brightness, 0, 255);
+    s.saturation = Clamp(s.saturation, 0, 255);
 
     return s;
 }
@@ -132,6 +141,9 @@ bool Save(int cameraIndex, const Settings& s)
     WriteDword(key, L"BlueBalance",  s.blueBalance);
     WriteDword(key, L"GreenBalance", s.greenBalance);
     WriteDword(key, L"TestPattern",  s.testPattern ? 1 : 0);
+
+    WriteDword(key, L"Brightness",   s.brightness);
+    WriteDword(key, L"Saturation",   s.saturation);
 
     RegCloseKey(key);
     return true;

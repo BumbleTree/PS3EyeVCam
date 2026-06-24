@@ -1,0 +1,105 @@
+; eyetoy_device.inf
+; Binds the inbox, Microsoft-signed WinUSB.sys to the PS2 EyeToy camera
+; interface (MI_00) so the user-space libusb path can open it. No custom kernel
+; driver. The audio interfaces (MI_01 = control, MI_02 = the 4-mic array) keep
+; their inbox USB Audio drivers untouched.
+;
+; Mirrors usb_device.inf (PS3 Eye); generated/signed the same way via
+; generate_driver.ps1. Two hardware IDs cover both EyeToy revisions
+; (054C:0154 and 054C:0155).
+[Strings]
+DeviceName  = "PS2 EyeToy Camera"
+VendorName  = "Sony / OmniVision Technologies, Inc."
+SourceName  = "PS2 EyeToy Camera Install Disk"
+DeviceIDA   = "VID_054C&PID_0154&MI_00"
+DeviceIDB   = "VID_054C&PID_0155&MI_00"
+DeviceGUID  = "{A659968A-BBFB-4C59-8E95-1B658F0A13E2}"
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = "USBDevice"
+ClassGuid   = {88bae032-5a81-49f0-bc3d-a4ff138216d6}
+Provider    = "libwdi"
+CatalogFile = eyetoy_device.cat
+DriverVer   = 06/22/2026, 6.1.7600.16385
+
+[ClassInstall32]
+Addreg = WinUSBDeviceClassReg
+
+[WinUSBDeviceClassReg]
+HKR,,,0,"Universal Serial Bus devices"
+HKR,,Icon,,-20
+
+[Manufacturer]
+%VendorName% = libusbDevice_WinUSB,NTx86,NTamd64,NTarm
+
+[libusbDevice_WinUSB.NTx86]
+%DeviceName% = USB_Install, USB\%DeviceIDA%
+%DeviceName% = USB_Install, USB\%DeviceIDB%
+
+[libusbDevice_WinUSB.NTamd64]
+%DeviceName% = USB_Install, USB\%DeviceIDA%
+%DeviceName% = USB_Install, USB\%DeviceIDB%
+
+[libusbDevice_WinUSB.NTarm]
+%DeviceName% = USB_Install, USB\%DeviceIDA%
+%DeviceName% = USB_Install, USB\%DeviceIDB%
+
+[USB_Install]
+Include = winusb.inf
+Needs   = WINUSB.NT
+
+[USB_Install.Services]
+Include    = winusb.inf
+AddService = WinUSB,0x00000002,WinUSB_ServiceInstall
+
+[WinUSB_ServiceInstall]
+DisplayName   = "WinUSB - Kernel Driver 08/09/2018 6.1.7600.16385"
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %12%\WinUSB.sys
+
+[USB_Install.Wdf]
+KmdfService = WINUSB, WinUsb_Install
+
+[WinUSB_Install]
+KmdfLibraryVersion = 1.11
+
+[USB_Install.HW]
+AddReg = AddDeviceInterfaceGUID
+
+[NoDeviceInterfaceGUID]
+; Avoids adding a DeviceInterfaceGUID for generic driver
+
+[AddDeviceInterfaceGUID]
+HKR,,DeviceInterfaceGUIDs,0x10000,%DeviceGUID%
+
+[USB_Install.CoInstallers]
+AddReg    = CoInstallers_AddReg
+CopyFiles = CoInstallers_CopyFiles
+
+[CoInstallers_AddReg]
+HKR,,CoInstallers32,0x00010000,"WdfCoInstaller01011.dll,WdfCoInstaller","WinUSBCoInstaller2.dll"
+
+[CoInstallers_CopyFiles]
+WinUSBCoInstaller2.dll
+WdfCoInstaller01011.dll
+
+[DestinationDirs]
+CoInstallers_CopyFiles = 11
+
+[SourceDisksNames]
+1 = %SourceName%
+
+[SourceDisksFiles.x86]
+WinUSBCoInstaller2.dll = 1,x86
+WdfCoInstaller01011.dll = 1,x86
+
+[SourceDisksFiles.amd64]
+WinUSBCoInstaller2.dll = 1,amd64
+WdfCoInstaller01011.dll = 1,amd64
+
+[SourceDisksFiles.arm]
+WinUSBCoInstaller2.dll = 1,arm
+WdfCoInstaller01011.dll = 1,arm

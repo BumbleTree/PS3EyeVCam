@@ -11,7 +11,7 @@ using Microsoft::WRL::ComPtr;
 namespace
 {
 
-constexpr wchar_t kTaskName[] = L"PS3EyeVCam";
+constexpr wchar_t kTaskName[] = L"PSCam4Win";
 
 // Tiny BSTR RAII so we don't need comdef.h/comsupp.lib.
 class Bstr
@@ -88,7 +88,7 @@ bool Enable()
 
     ComPtr<IRegistrationInfo> regInfo;
     if (SUCCEEDED(def->get_RegistrationInfo(&regInfo)))
-        regInfo->put_Description(Bstr(L"Starts the PS3 Eye virtual camera in the background at logon."));
+        regInfo->put_Description(Bstr(L"Starts the PSCam4Win virtual cameras in the background at logon."));
 
     // Elevated at logon without UAC: interactive token at highest run level.
     ComPtr<IPrincipal> principal;

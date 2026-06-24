@@ -1,11 +1,11 @@
 #pragma once
 //
-// PS3EyeVCam.dll — Media Foundation custom media source for the Windows 11
+// PSCam4Win.dll — Media Foundation custom media source for the Windows 11
 // virtual camera (MFCreateVirtualCamera) pipeline.
 //
 // These objects are instantiated inside the Camera Frame Server service, not
 // in the host app. They read YUY2 frames from the FrameBus shared-memory
-// section published by PS3EyeVCamHost.exe and deliver them as-is to YUY2
+// section published by PSCam4WinTray.exe and deliver them as-is to YUY2
 // clients or converted to NV12 on the fly.
 //
 // Built against SDK 10.0.19041: every interface used here (IMFMediaSourceEx,
@@ -153,6 +153,7 @@ private:
 
     // Negotiated/advertised format (fixed for the lifetime of the source).
     GUID     _subtype = MFVideoFormat_NV12;
+    uint32_t _consumerMask = 0;  // ControlBus ConsumerFormat bit for _subtype
     uint32_t _width = 640, _height = 480, _fpsNum = 60, _fpsDen = 1;
     uint32_t _frameBytes = 0;
     LONGLONG _frameDuration = 166667;  // 100ns units
@@ -165,6 +166,12 @@ private:
     // snapshot of the old one; shared ownership keeps that buffer alive.
     std::shared_ptr<uint8_t[]> _staging;
     std::unique_ptr<uint8_t[]> _busStaging; // bus-sized scratch, allocated once, guarded by _deliverLock
+    // JFIF sidecar scratch for MJPEG passthrough; allocated only when the device
+    // advertises MJPEG (null on PS3 Eye). _lastJpegLen holds the last delivered
+    // length so a deadline redeliver re-sends the previous JPEG. Guarded by
+    // _deliverLock. (TDD §5.4 / §8.2)
+    std::unique_ptr<uint8_t[]> _jpegStaging;
+    uint32_t                   _lastJpegLen = 0;
 
     // Sleep/wake keepalive towards the host. Closed by the destructor, not by
     // Shutdown (same in-flight-call rationale as _bus).

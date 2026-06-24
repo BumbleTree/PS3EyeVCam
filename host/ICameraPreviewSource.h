@@ -4,11 +4,11 @@
 // preview UI and whatever transport a given camera driver uses to publish
 // frames to the tray.
 //
-// The preview window speaks only to this interface. Today the only
-// implementation is Ps3EyePreviewSource, which wraps the FrameBus seqlock
-// shared memory + the read-only ControlBus activity query. When an EyeToy (or
-// other legacy) driver is added later it ships its own implementation; the
-// preview UI, the worker thread, and the dialog template do not change.
+// The preview window speaks only to this interface. The implementation is
+// FrameBusPreviewSource, which wraps the FrameBus seqlock shared memory + the
+// read-only ControlBus activity query. It is transport-agnostic — every device
+// (PS3 Eye, EyeToy, ...) publishes to the same FrameBus, so no per-device
+// preview implementation is needed; the preview UI and worker thread are fixed.
 //
 // Implementations must be safe to call from a single dedicated worker thread
 // (TryOpen / ReadFormat / WaitFrame / TryReadNewer / IsCameraInUse). They

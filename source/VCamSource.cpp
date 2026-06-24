@@ -13,7 +13,7 @@ void VCamTrace(const wchar_t* fmt, ...)
     _vsnwprintf_s(buf, _TRUNCATE, fmt, args);
     va_end(args);
     wchar_t line[560];
-    _snwprintf_s(line, _TRUNCATE, L"PS3EyeVCam: %s\n", buf);
+    _snwprintf_s(line, _TRUNCATE, L"PSCam4Win: %s\n", buf);
     OutputDebugStringW(line);
 }
 
@@ -204,7 +204,7 @@ HRESULT MediaStream::Initialize()
     // The host publishes the FrameBus before registering the virtual camera,
     // so normally the real capture format is already known here. The fallback
     // only triggers if the source is activated while the host is not running.
-    framebus::Header fmt{};
+    framebus::HotHeader fmt{};
     uint32_t defaultWidth = 640, defaultHeight = 480;
     uint32_t defaultFpsNum = 60, defaultFpsDen = 1;
     if (_bus.TryOpen(_cameraIndex) && _bus.ReadFormat(fmt))
@@ -249,39 +249,73 @@ HRESULT MediaStream::Initialize()
     _attributes->SetUINT32(MF_DEVICESTREAM_FRAMESERVER_SHARED, 1);
     _attributes->SetUINT32(MF_DEVICESTREAM_ATTRIBUTE_FRAMESOURCE_TYPES, kFrameSourceTypeColor);
 
+    // Advertised media types come from the FrameBus capability block (ColdBlock),
+    // NOT a hardcoded mode table, so each device advertises exactly its own
+    // modes/formats. The host writes the ColdBlock before registering the virtual
+    // camera (TDD §8.3), so it is present here whenever the camera is live; if it
+    // is absent we fail rather than leak another device's defaults.
+    framebus::ColdBlock cold{};
+    if (!(_bus.IsOpen() && _bus.ReadColdBlock(cold)))
+    {
+        VCamTrace(L"stream: FrameBus ColdBlock unavailable -- cannot build media types");
+        return E_FAIL;
+    }
+
+    // Per-transport default subtype (NV12 for PS3 Eye, YUY2 for EyeToy).
+    const GUID defaultSubtype =
+        (cold.defaultFormat == framebus::kFmtYUY2)  ? MFVideoFormat_YUY2 :
+        (cold.defaultFormat == framebus::kFmtMJPEG) ? MFVideoFormat_MJPG :
+                                                      MFVideoFormat_NV12;
+
+    // Fixed emit order so an unchanged device (PS3 Eye, mask YUY2|NV12) advertises
+    // the identical NV12-then-YUY2 ordering it always has; only formats present in
+    // the mode's mask are created.
+    struct FmtMap { uint32_t bit; GUID subtype; };
+    static const FmtMap kFmts[] = {
+        { framebus::kFmtNV12,  MFVideoFormat_NV12 },
+        { framebus::kFmtYUY2,  MFVideoFormat_YUY2 },
+        { framebus::kFmtMJPEG, MFVideoFormat_MJPG },
+    };
+
     std::vector<IMFMediaType*> typesList;
     ComPtr<IMFMediaType> defaultType;
 
-    for (int i = 0; i < kVideoModeCount; ++i)
+    for (uint32_t i = 0; i < cold.modeCount; ++i)
     {
-        // 1. Add NV12 (default)
-        ComPtr<IMFMediaType> mtNV12;
-        hr = CreateMediaType(kVideoModes[i].width, kVideoModes[i].height, kVideoModes[i].fps, 1, MFVideoFormat_NV12, &mtNV12);
-        if (SUCCEEDED(hr))
+        const framebus::ColdMode& m = cold.modes[i];
+        for (const FmtMap& f : kFmts)
         {
-            typesList.push_back(mtNV12.Get());
-            mtNV12->AddRef();
+            if (!(m.formatMask & f.bit))
+                continue;
+            ComPtr<IMFMediaType> mt;
+            if (FAILED(CreateMediaType(m.width, m.height, m.fps, 1, f.subtype, &mt)))
+                continue;
+            typesList.push_back(mt.Get());
+            mt->AddRef();
 
-            if (kVideoModes[i].width == defaultWidth &&
-                kVideoModes[i].height == defaultHeight &&
-                kVideoModes[i].fps == defaultFpsNum)
+            if (!defaultType &&
+                m.width == defaultWidth && m.height == defaultHeight &&
+                m.fps == defaultFpsNum && f.subtype == defaultSubtype)
             {
-                defaultType = mtNV12;
+                defaultType = mt;
             }
-        }
-
-        // 2. Add YUY2
-        ComPtr<IMFMediaType> mtYUY2;
-        hr = CreateMediaType(kVideoModes[i].width, kVideoModes[i].height, kVideoModes[i].fps, 1, MFVideoFormat_YUY2, &mtYUY2);
-        if (SUCCEEDED(hr))
-        {
-            typesList.push_back(mtYUY2.Get());
-            mtYUY2->AddRef();
         }
     }
 
     if (typesList.empty())
         return E_FAIL;
+
+    // MJPEG passthrough needs a JFIF scratch buffer; allocate it only when the
+    // device actually advertises MJPEG (PS3 Eye never does, so it pays nothing).
+    bool advertisesMjpeg = false;
+    for (uint32_t i = 0; i < cold.modeCount; ++i)
+        if (cold.modes[i].formatMask & framebus::kFmtMJPEG) { advertisesMjpeg = true; break; }
+    if (advertisesMjpeg)
+    {
+        _jpegStaging.reset(new (std::nothrow) uint8_t[framebus::kMaxJpegBytes]);
+        if (!_jpegStaging)
+            return E_OUTOFMEMORY;
+    }
 
     if (!defaultType)
     {
@@ -320,20 +354,27 @@ HRESULT MediaStream::CreateMediaType(uint32_t width, uint32_t height, uint32_t f
     MFSetAttributeRatio(mt.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
     mt->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
     mt->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE);
-    mt->SetUINT32(MF_MT_FIXED_SIZE_SAMPLES, TRUE);
 
-    uint32_t sampleSize = 0;
     if (subtype == MFVideoFormat_NV12)
     {
-        sampleSize = framebus::Nv12Bytes(width, height);
+        mt->SetUINT32(MF_MT_FIXED_SIZE_SAMPLES, TRUE);
         mt->SetUINT32(MF_MT_DEFAULT_STRIDE, width);
+        mt->SetUINT32(MF_MT_SAMPLE_SIZE, framebus::Nv12Bytes(width, height));
     }
     else if (subtype == MFVideoFormat_YUY2)
     {
-        sampleSize = width * height * 2;
+        mt->SetUINT32(MF_MT_FIXED_SIZE_SAMPLES, TRUE);
         mt->SetUINT32(MF_MT_DEFAULT_STRIDE, width * 2);
+        mt->SetUINT32(MF_MT_SAMPLE_SIZE, width * height * 2);
     }
-    mt->SetUINT32(MF_MT_SAMPLE_SIZE, sampleSize);
+    else if (subtype == MFVideoFormat_MJPG)
+    {
+        // Compressed, variable-size: each JFIF frame is an independent keyframe.
+        // No fixed sample size and no stride; advertise the sidecar capacity as
+        // the max buffer hint.
+        mt->SetUINT32(MF_MT_FIXED_SIZE_SAMPLES, FALSE);
+        mt->SetUINT32(MF_MT_SAMPLE_SIZE, framebus::kMaxJpegBytes);
+    }
 
     *ppType = mt.Detach();
     return S_OK;
@@ -359,11 +400,23 @@ void MediaStream::PingActivity(bool forceWakeSignal)
             return;
     }
     _ping.Stamp();                          // always tick BEFORE event
+    _ping.SetConsumerMask(_consumerMask);   // re-assert after any (re)open
     if (forceWakeSignal || now - _lastWakeSignalTick >= 1000)
     {
         _lastWakeSignalTick = now;
         _ping.SignalWake();
     }
+}
+
+// Maps a negotiated MF subtype to the ControlBus consumer bit the host reads to
+// gate optional per-frame work (e.g. the JPEG sidecar). Unknown subtypes map to
+// 0, which the host treats as "decode YUY2, skip JPEG".
+static uint32_t ConsumerBitForSubtype(const GUID& subtype)
+{
+    if (subtype == MFVideoFormat_YUY2) return controlbus::kConsumeYUY2;
+    if (subtype == MFVideoFormat_NV12) return controlbus::kConsumeNV12;
+    if (subtype == MFVideoFormat_MJPG) return controlbus::kConsumeMJPEG;
+    return 0;
 }
 
 HRESULT MediaStream::Start(const PROPVARIANT* startPosition)
@@ -399,6 +452,7 @@ HRESULT MediaStream::Start(const PROPVARIANT* startPosition)
     _fpsNum = fpsNum;
     _fpsDen = fpsDen;
     _subtype = subtype;
+    _consumerMask = ConsumerBitForSubtype(subtype);  // host gates JPEG sidecar on this
     _frameBytes = (subtype == MFVideoFormat_YUY2) ? framebus::Yuy2Bytes(width, height)
                                                   : framebus::Nv12Bytes(width, height);
     _frameDuration = MulDiv(10000000, fpsDen, fpsNum);
@@ -408,7 +462,7 @@ HRESULT MediaStream::Start(const PROPVARIANT* startPosition)
 
     VCamTrace(L"stream: started with format %ux%u @ %u/%u (subtype YUY2=%d)",
               width, height, fpsNum, fpsDen, (subtype == MFVideoFormat_YUY2));
-    PingActivity(true);
+    PingActivity(true);  // publishes _consumerMask alongside the keepalive
     return _queue->QueueEventParamVar(MEStreamStarted, GUID_NULL, S_OK, startPosition);
 }
 
@@ -418,6 +472,8 @@ HRESULT MediaStream::Stop()
     if (_shutdown)
         return MF_E_SHUTDOWN;
     _state = MF_STREAM_STATE_STOPPED;
+    _consumerMask = 0;
+    _ping.SetConsumerMask(0);               // no active client consuming this format
     VCamTrace(L"stream: stopped");
     return _queue->QueueEventParamVar(MEStreamStopped, GUID_NULL, S_OK, nullptr);
 }
@@ -429,6 +485,8 @@ HRESULT MediaStream::Shutdown()
         return S_OK;
     _shutdown = true;
     _state = MF_STREAM_STATE_STOPPED;
+    _consumerMask = 0;
+    _ping.SetConsumerMask(0);               // client gone; stop gating work on it
     if (_queue)
         _queue->Shutdown();
     // _bus is intentionally NOT closed here: a DeliverSample call on another
@@ -581,6 +639,11 @@ HRESULT MediaStream::DeliverSample(IUnknown* token)
         staging       = _staging;
     }
 
+    // MJPEG clients (EyeToy) get the source JFIF passed through verbatim; YUY2/
+    // NV12 clients get the decoded/converted frame. _jpegStaging is null unless
+    // the device advertises MJPEG, so PS3 never enters the passthrough path.
+    const bool isMjpeg = (subtype == MFVideoFormat_MJPG);
+
     // Pace delivery to the camera: wait for a frame newer than the last one
     // we handed out, sleeping on the writer's frame-ready event between
     // attempts (Sleep-based polling was quantized to the 15.6ms system timer
@@ -611,7 +674,7 @@ HRESULT MediaStream::DeliverSample(IUnknown* token)
         }
         else
         {
-            framebus::Header fmt{};
+            framebus::HotHeader fmt{};
             if (_bus.ReadFormat(fmt))
             {
                 const uint32_t busWidth = fmt.width;
@@ -619,7 +682,27 @@ HRESULT MediaStream::DeliverSample(IUnknown* token)
                 const uint32_t busFrameBytes = framebus::Yuy2Bytes(busWidth, busHeight);
                 const LONG64 lastFrameId = _lastFrameId.load(std::memory_order_relaxed);
 
-                if (busWidth == width && busHeight == height)
+                if (isMjpeg)
+                {
+                    // Passthrough: copy the JFIF sidecar verbatim (no decode).
+                    // Valid only at matching resolution — a JPEG can't be
+                    // rescaled without decoding; dst=nullptr skips the YUY2 copy.
+                    if (busWidth == width && busHeight == height && _jpegStaging)
+                    {
+                        uint32_t jpegLen = 0;
+                        const LONG64 id = _bus.TryReadNewer(
+                            nullptr, busFrameBytes,
+                            _jpegStaging.get(), framebus::kMaxJpegBytes, jpegLen,
+                            lastFrameId);
+                        if (id != 0 && jpegLen != 0)
+                        {
+                            _lastFrameId.store(id, std::memory_order_relaxed);
+                            _lastJpegLen = jpegLen;
+                            break;
+                        }
+                    }
+                }
+                else if (busWidth == width && busHeight == height)
                 {
                     const LONG64 id = _bus.TryReadNewer(staging.get(), busFrameBytes, lastFrameId);
                     if (id != 0)
@@ -662,10 +745,20 @@ HRESULT MediaStream::DeliverSample(IUnknown* token)
             Sleep(waitMs > 20 ? 20 : waitMs);  // host absent: cheap idle wait
     }
 
+    // MJPEG samples are variable-size (the JFIF length); YUY2/NV12 are fixed.
+    const DWORD outBytes = isMjpeg ? _lastJpegLen : frameBytes;
+    if (isMjpeg && outBytes == 0)
+    {
+        // No JFIF available yet (cold start before the first frame, or host
+        // absent). Skip this delivery rather than emit a malformed JPEG; the
+        // client will request another sample.
+        return S_OK;
+    }
+
     ComPtr<IMFSample> sample;
     ComPtr<IMFMediaBuffer> buffer;
     HRESULT hr = MFCreateSample(&sample);
-    if (SUCCEEDED(hr)) hr = MFCreateMemoryBuffer(frameBytes, &buffer);
+    if (SUCCEEDED(hr)) hr = MFCreateMemoryBuffer(outBytes, &buffer);
     if (SUCCEEDED(hr))
     {
         BYTE* data = nullptr;
@@ -673,17 +766,22 @@ HRESULT MediaStream::DeliverSample(IUnknown* token)
         hr = buffer->Lock(&data, &maxLen, nullptr);
         if (SUCCEEDED(hr))
         {
-            if (subtype == MFVideoFormat_YUY2)
+            if (isMjpeg)
+            {
+                // Passthrough: hand the source JFIF to the client untouched.
+                memcpy(data, _jpegStaging.get(), outBytes);
+            }
+            else if (subtype == MFVideoFormat_YUY2)
             {
                 // Native path: the bus frame is already YUY2 — no conversion.
-                memcpy(data, staging.get(), frameBytes);
+                memcpy(data, staging.get(), outBytes);
             }
             else
             {
                 Yuy2ToNv12(staging.get(), data, width, height);
             }
             buffer->Unlock();
-            buffer->SetCurrentLength(frameBytes);
+            buffer->SetCurrentLength(outBytes);
         }
     }
     if (SUCCEEDED(hr)) hr = sample->AddBuffer(buffer.Get());

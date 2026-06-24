@@ -1,5 +1,5 @@
 //
-// PS3EyeVCamTray — entry point.
+// PSCam4WinTray — entry point.
 //
 // CLI (all run elevated via the embedded manifest):
 //   (none)               start the tray app
@@ -25,7 +25,7 @@
 
 namespace
 {
-constexpr wchar_t kSingleInstanceMutex[] = L"Global\\PS3EyeVCam.Tray.SingleInstance";
+constexpr wchar_t kSingleInstanceMutex[] = L"Global\\PSCam4Win.Tray.SingleInstance";
 
 bool HasArg(int argc, wchar_t** argv, const wchar_t* name)
 {
@@ -75,6 +75,22 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         return 0;
     }
 
+    // Refuse to run alongside a pre-rebrand PS3EyeVCam tray: it uses different
+    // IPC names but registers the SAME virtual-camera CLSIDs, so two live
+    // instances would collide on MFCreateVirtualCamera. The installer removes
+    // the legacy app, but its logon task may still fire once before that.
+    if (HANDLE legacy = OpenMutexW(SYNCHRONIZE, FALSE, L"Global\\PS3EyeVCam.Tray.SingleInstance"))
+    {
+        CloseHandle(legacy);
+        MessageBoxW(nullptr,
+                    L"An older \"PS3 Eye Virtual Camera\" is still running. "
+                    L"Close it (and rerun the installer to remove it), then start PSCam4Win.",
+                    L"PSCam4Win", MB_ICONWARNING | MB_OK);
+        if (mutex)
+            CloseHandle(mutex);
+        return 0;
+    }
+
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);  // UI thread STA
     INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_BAR_CLASSES | ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&icc);
@@ -88,7 +104,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 
     if (!tray.Create(instance, controllers))
     {
-        MessageBoxW(nullptr, L"Failed to create the tray window.", L"PS3 Eye Camera",
+        MessageBoxW(nullptr, L"Failed to create the tray window.", L"PSCam4Win",
                     MB_ICONERROR | MB_OK);
         return 1;
     }
@@ -101,7 +117,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     }
     if (!anyStarted)
     {
-        MessageBoxW(nullptr, L"Failed to start the camera threads.", L"PS3 Eye Camera",
+        MessageBoxW(nullptr, L"Failed to start the camera threads.", L"PSCam4Win",
                     MB_ICONERROR | MB_OK);
         tray.Destroy();
         return 1;

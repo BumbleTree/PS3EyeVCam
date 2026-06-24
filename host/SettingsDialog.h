@@ -20,6 +20,12 @@ namespace settingsdialog
     // change or external settings change. No-op when the dialog is closed.
     void RefreshStatus();
 
+    // Refresh the camera dropdown after a device plug/unplug. Cheap no-op when
+    // the dialog is closed or the set of connected cameras is unchanged; only
+    // rebuilds the list (and, if the viewed camera itself vanished, reloads its
+    // controls/preview) when membership actually changed. No-op when closed.
+    void RefreshCameraList();
+
     HWND Hwnd();
     void Close();
 }

@@ -14,12 +14,6 @@
 namespace
 {
 constexpr UINT kTrayIconId = 1;
-
-// DeviceInterfaceGUIDs value installed by driver/usb_device.inf for the
-// PS3 Eye's WinUSB video interface (MI_00). Arrival/removal of this
-// interface is exactly the moment libusb can/can't open the camera.
-constexpr GUID kPs3EyeInterfaceGuid =
-    { 0x4bcc4c51, 0x4249, 0x4ae8, { 0x98, 0xbf, 0x35, 0x6b, 0x2c, 0x53, 0x0e, 0x77 } };
 }
 
 bool TrayUI::Create(HINSTANCE instance, CaptureController* controllers)
@@ -40,7 +34,7 @@ bool TrayUI::Create(HINSTANCE instance, CaptureController* controllers)
     // A normal (never-shown) top-level window, NOT a message-only window:
     // broadcast messages like TaskbarCreated are only delivered to top-level
     // windows.
-    _hwnd = CreateWindowExW(0, kWindowClass, L"PS3 Eye Virtual Camera",
+    _hwnd = CreateWindowExW(0, kWindowClass, L"PSCam4Win Virtual Camera",
                             WS_OVERLAPPED, 0, 0, 0, 0, nullptr, nullptr, instance, this);
     if (!_hwnd)
         return false;
@@ -51,13 +45,18 @@ bool TrayUI::Create(HINSTANCE instance, CaptureController* controllers)
     ChangeWindowMessageFilterEx(_hwnd, _taskbarCreatedMsg, MSGFLT_ALLOW, nullptr);
     ChangeWindowMessageFilterEx(_hwnd, WM_SHOW_SETTINGS, MSGFLT_ALLOW, nullptr);
 
-    // Subscribe to PS3 Eye interface arrival/removal so the capture threads
-    // can re-evaluate slot occupancy immediately instead of polling.
-    DEV_BROADCAST_DEVICEINTERFACE_W filter{};
-    filter.dbcc_size = sizeof(filter);
-    filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
-    filter.dbcc_classguid = kPs3EyeInterfaceGuid;
-    _devNotify = RegisterDeviceNotificationW(_hwnd, &filter, DEVICE_NOTIFY_WINDOW_HANDLE);
+    // Subscribe to each camera interface (PS3 Eye + EyeToy) arrival/removal so
+    // the capture threads can re-evaluate slot occupancy immediately instead of
+    // polling. One registration per GUID; DBT_DEVICEARRIVAL/REMOVECOMPLETE for
+    // any of them lands in the same WndProc handler.
+    for (int i = 0; i < kCameraInterfaceGuidCount; ++i)
+    {
+        DEV_BROADCAST_DEVICEINTERFACE_W filter{};
+        filter.dbcc_size = sizeof(filter);
+        filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
+        filter.dbcc_classguid = kCameraInterfaceGuids[i];
+        _devNotify[i] = RegisterDeviceNotificationW(_hwnd, &filter, DEVICE_NOTIFY_WINDOW_HANDLE);
+    }
 
     AddTrayIcon();
     return true;
@@ -66,10 +65,13 @@ bool TrayUI::Create(HINSTANCE instance, CaptureController* controllers)
 void TrayUI::Destroy()
 {
     RemoveTrayIcon();
-    if (_devNotify)
+    for (int i = 0; i < kCameraInterfaceGuidCount; ++i)
     {
-        UnregisterDeviceNotification(_devNotify);
-        _devNotify = nullptr;
+        if (_devNotify[i])
+        {
+            UnregisterDeviceNotification(_devNotify[i]);
+            _devNotify[i] = nullptr;
+        }
     }
     if (_hwnd)
     {
@@ -87,7 +89,7 @@ void TrayUI::AddTrayIcon()
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
     nid.uCallbackMessage = WM_TRAY;
     nid.hIcon = _icon;
-    wcscpy_s(nid.szTip, L"PS3 Eye Virtual Camera");
+    wcscpy_s(nid.szTip, L"PSCam4Win Virtual Camera");
     Shell_NotifyIconW(_iconAdded ? NIM_MODIFY : NIM_ADD, &nid);
     if (!_iconAdded)
     {
@@ -147,20 +149,20 @@ void TrayUI::UpdateTooltip()
 
     if (streamingCount > 0)
     {
-        swprintf_s(nid.szTip, L"PS3 Eye — %d streaming (max %.1f fps), %d idle",
+        swprintf_s(nid.szTip, L"PSCam4Win — %d streaming (max %.1f fps), %d idle",
                    streamingCount, maxFps, asleepCount);
     }
     else if (failedCount > 0)
     {
-        wcscpy_s(nid.szTip, L"PS3 Eye — virtual camera error (retrying)");
+        wcscpy_s(nid.szTip, L"PSCam4Win — virtual camera error (retrying)");
     }
     else if (asleepCount > 0)
     {
-        swprintf_s(nid.szTip, L"PS3 Eye — %d idle (camera sleeping)", asleepCount);
+        swprintf_s(nid.szTip, L"PSCam4Win — %d idle (camera sleeping)", asleepCount);
     }
     else
     {
-        wcscpy_s(nid.szTip, L"PS3 Eye — no cameras detected");
+        wcscpy_s(nid.szTip, L"PSCam4Win — no cameras detected");
     }
 
     Shell_NotifyIconW(NIM_MODIFY, &nid);
@@ -220,7 +222,7 @@ void TrayUI::ShowContextMenu(POINT anchor)
     SetMenuDefaultItem(menu, IDM_SETTINGS, FALSE);
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     // Quick toggles act on camera 0 only; per-camera control is in Settings.
-    AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, kVCamFriendlyNames[0]);
+    AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, L"PSCam4Win — camera 0");
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(modeMenu), L"Video &mode");
     AppendMenuW(menu, MF_STRING | (s.flipH ? MF_CHECKED : 0), IDM_FLIPH, L"Flip &horizontally");
     AppendMenuW(menu, MF_STRING | (s.flipV ? MF_CHECKED : 0), IDM_FLIPV, L"Flip &vertically");
@@ -280,7 +282,7 @@ void TrayUI::OnCommand(int id)
         if (autostart::IsEnabled())
             autostart::Disable();
         else if (!autostart::Enable())
-            ShowBalloon(L"PS3 Eye Camera", L"Could not update the scheduled task.");
+            ShowBalloon(L"PSCam4Win", L"Could not update the scheduled task.");
         break;
     case IDM_EXIT:
         PostQuitMessage(0);
@@ -352,9 +354,13 @@ LRESULT TrayUI::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     case WM_CONTROLLER_STATE:
         UpdateTooltip();
         settingsdialog::RefreshStatus();
+        // A state change is also how a plug/unplug surfaces (a slot enters or
+        // leaves CameraMissing): keep the Settings dropdown in sync. Internally
+        // a cheap no-op unless the set of connected cameras actually changed.
+        settingsdialog::RefreshCameraList();
         if (static_cast<CaptureController::State>(wParam) == CaptureController::State::Fatal)
         {
-            ShowBalloon(L"PS3 Eye Camera",
+            ShowBalloon(L"PSCam4Win",
                         L"A fatal error occurred — the virtual camera is not available.");
         }
         return 0;

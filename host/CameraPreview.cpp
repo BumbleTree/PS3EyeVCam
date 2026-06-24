@@ -4,7 +4,7 @@
 #include <cstring>
 
 #include "CaptureController.h"
-#include "Ps3EyePreviewSource.h"
+#include "FrameBusPreviewSource.h"
 #include "../common/FrameBus.h"
 #include "../common/Settings.h"
 #include "../res/resource.h"
@@ -112,6 +112,9 @@ void CameraPreview::Detach()
     _dibW = _dibH = 0;
     _inUse.store(false, std::memory_order_relaxed);
     ReleaseSRWLockExclusive(&_dibLock);
+
+    // Back buffer is UI-thread-only; the worker is joined, so no lock needed.
+    DestroyBackBuffer();
 }
 
 void CameraPreview::StopWorker()
@@ -240,62 +243,131 @@ void CameraPreview::ResizeToAspect()
     if (cellW <= 0 || cellH <= 0)
         return;
 
-    // Largest srcW:srcH rect that fits inside the cell, centered.
-    int w = cellW, h = cellH;
-    if (srcW * h > w * srcH)
-        h = (w * srcH) / srcW;   // too wide — clamp height
-    else
-        w = (h * srcW) / srcH;   // too tall — clamp width
-    const int x = cellX + (cellW - w) / 2;
-    const int y = cellY + (cellH - h) / 2;
+    // Fill the full cell width and derive the height from the true source
+    // aspect, so the preview is a gap-free srcW:srcH rectangle — no letterbox
+    // bars, no distortion. The dialog cell is sized ~4:3 (see app.rc) so the
+    // height lands just inside it; any spare pixels sit below the image as plain
+    // dialog background, never as bars framing it. If the derived height would
+    // overflow a very short cell, clamp to the height and narrow the width.
+    int w = cellW;
+    int h = (cellW * srcH) / srcW;
+    if (h > cellH)
+    {
+        h = cellH;
+        w = (cellH * srcW) / srcH;
+    }
+    const int x = cellX + (cellW - w) / 2;   // centred horizontally (== cellX when w == cellW)
+    const int y = cellY;                      // anchored at the top
 
     SetWindowPos(_wnd, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
     InvalidateRect(_wnd, nullptr, FALSE);
 }
 
+bool CameraPreview::EnsureBackBuffer(HDC ref, int w, int h)
+{
+    if (_backDc && _backW == w && _backH == h)
+        return true;
+    DestroyBackBuffer();
+    if (w <= 0 || h <= 0)
+        return false;
+
+    _backDc = CreateCompatibleDC(ref);
+    if (!_backDc)
+        return false;
+    // NOTE: the bitmap must be compatible with the WINDOW DC (ref), not the
+    // memory DC — a bitmap "compatible" with a fresh memory DC is 1bpp
+    // monochrome, which would turn the preview black-and-white.
+    _backBmp = CreateCompatibleBitmap(ref, w, h);
+    if (!_backBmp)
+    {
+        DeleteDC(_backDc);
+        _backDc = nullptr;
+        return false;
+    }
+    _backOld = static_cast<HBITMAP>(SelectObject(_backDc, _backBmp));
+    _backW = w;
+    _backH = h;
+    return true;
+}
+
+void CameraPreview::DestroyBackBuffer()
+{
+    if (_backDc)  { SelectObject(_backDc, _backOld); DeleteDC(_backDc); _backDc = nullptr; _backOld = nullptr; }
+    if (_backBmp) { DeleteObject(_backBmp); _backBmp = nullptr; }
+    _backW = _backH = 0;
+}
+
 void CameraPreview::Paint(HDC hdc, int w, int h)
 {
-    // Hold the shared lock for the whole blit. The worker takes this lock
-    // exclusive only inside RecreateDib (rare — only when the format
-    // changes) and during the ~1ms write+convert, so contention is
-    // negligible in steady state. This guarantees the DC is not destroyed
-    // and the bits are not mutated mid-blit.
+    if (w <= 0 || h <= 0)
+        return;
+
+    // Compose the whole frame off-screen, then blit it to the window in one
+    // shot. Drawing the scaled frame and the "in use" badge straight to the
+    // window DC ~60x/sec made the badge (overdrawn by every new frame and then
+    // redrawn) flicker, and pushed a full StretchBlt to the screen each frame.
+    // A single BitBlt of a fully-composed buffer updates the screen atomically:
+    // no flicker, and the only screen-bound work per frame is one BitBlt.
+    const HDC dc = EnsureBackBuffer(hdc, w, h) ? _backDc : hdc;
+
+    // Hold the shared lock for the scale. The worker takes it exclusive only
+    // inside RecreateDib (rare) and for the ~1ms write+convert, so contention
+    // is negligible; this guarantees the source DIB is neither destroyed nor
+    // mutated mid-read.
     AcquireSRWLockShared(&_dibLock);
     const bool haveFrame = _dibDc && _dibW > 0 && _dibH > 0;
     if (haveFrame)
-        StretchBlt(hdc, 0, 0, w, h, _dibDc, 0, 0, _dibW, _dibH, SRCCOPY);
+    {
+        // High-quality interpolated scale. The preview box is smaller than the
+        // 640x480 source, so this is a shrink; GDI's default BLACKONWHITE mode
+        // boolean-ANDs the eliminated pixels when shrinking a colour image,
+        // darkening it and shredding fine detail — which made the preview look
+        // far worse than the real stream (most visible on the sharp PS3 Eye).
+        // HALFTONE averages the source pixels for a faithful reproduction; it
+        // requires the brush origin to be reset to avoid mis-aligned dithering.
+        SetStretchBltMode(dc, HALFTONE);
+        SetBrushOrgEx(dc, 0, 0, nullptr);
+        StretchBlt(dc, 0, 0, w, h, _dibDc, 0, 0, _dibW, _dibH, SRCCOPY);
+    }
     const bool inUse = _inUse.load(std::memory_order_relaxed);
     ReleaseSRWLockShared(&_dibLock);
 
-    HFONT oldFnt = static_cast<HFONT>(SelectObject(hdc, DialogFont(_wnd)));
+    HFONT oldFnt = static_cast<HFONT>(SelectObject(dc, DialogFont(_wnd)));
 
     if (!haveFrame)
     {
         RECT rc{ 0, 0, w, h };
-        FillRect(hdc, &rc, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+        FillRect(dc, &rc, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
         const wchar_t* text = L"Waiting for camera...";
-        SetTextColor(hdc, RGB(170, 170, 170));
-        SetBkMode(hdc, TRANSPARENT);
-        DrawTextW(hdc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SetTextColor(dc, RGB(170, 170, 170));
+        SetBkMode(dc, TRANSPARENT);
+        DrawTextW(dc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
     else if (inUse)
     {
-        // "In use by another app" badge. Solid dark rectangle — no per-paint
-        // DC/bitmap churn. Drawn after the blit so it sits on top.
+        // "In use by another app" badge. Composited into the back buffer with
+        // the frame, so it never flickers. Drawn after the blit so it sits on
+        // top.
         const wchar_t* text = L"  in use by another app  ";
         SIZE sz{};
-        GetTextExtentPoint32W(hdc, text, static_cast<int>(wcslen(text)), &sz);
+        GetTextExtentPoint32W(dc, text, static_cast<int>(wcslen(text)), &sz);
         const int bw = sz.cx + 8, bh = sz.cy + 4;
         RECT badge{ 6, 4, 6 + bw, 4 + bh };
         const HBRUSH bg = CreateSolidBrush(RGB(0, 0, 0));
-        FillRect(hdc, &badge, bg);
+        FillRect(dc, &badge, bg);
         DeleteObject(bg);
-        SetTextColor(hdc, RGB(255, 220, 0));
-        SetBkMode(hdc, TRANSPARENT);
-        DrawTextW(hdc, text, -1, &badge, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SetTextColor(dc, RGB(255, 220, 0));
+        SetBkMode(dc, TRANSPARENT);
+        DrawTextW(dc, text, -1, &badge, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
 
-    SelectObject(hdc, oldFnt);
+    SelectObject(dc, oldFnt);
+
+    // Present the composed buffer in a single atomic blit. (When the back
+    // buffer could not be created we drew straight to the window above, so dc
+    // == hdc and there is nothing to present.)
+    if (dc != hdc)
+        BitBlt(hdc, 0, 0, w, h, _backDc, 0, 0, SRCCOPY);
 }
 
 DWORD WINAPI CameraPreview::WorkerProc(LPVOID selfp)
@@ -326,7 +398,7 @@ DWORD WINAPI CameraPreview::WorkerProc(LPVOID selfp)
             if (self->_source)
                 self->_source->Close();
             else
-                self->_source = std::make_unique<Ps3EyePreviewSource>();
+                self->_source = std::make_unique<FrameBusPreviewSource>();
             if (!self->_source->TryOpen(cam))
             {
                 // Producer not ready (host still starting up, or dialog just

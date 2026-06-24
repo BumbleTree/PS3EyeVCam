@@ -1,4 +1,4 @@
-"""Builds res/PS3EyeVCam.ico.
+"""Builds res/PSCam4Win.ico.
 
 If ps3eye_source.png exists next to this script (e.g. real PlayStation Eye
 logo art), it is center-fitted onto a transparent square and used directly.
@@ -10,7 +10,7 @@ from PIL import Image, ImageDraw
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SOURCE = os.path.join(HERE, "ps3eye_source.png")
-OUT = os.path.join(HERE, "PS3EyeVCam.ico")
+OUT = os.path.join(HERE, "PSCam4Win.ico")
 SIZES = [256, 64, 48, 32, 24, 20, 16]
 S = 1024  # supersampled master canvas
 

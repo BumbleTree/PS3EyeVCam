@@ -1,5 +1,5 @@
 //
-// COM plumbing for PS3EyeVCam.dll: the IMFActivate the Frame Server CoCreates
+// COM plumbing for PSCam4Win.dll: the IMFActivate the Frame Server CoCreates
 // (via the CLSID passed to MFCreateVirtualCamera), the class factory, the
 // self-registration entry points, and module lifetime tracking.
 //
@@ -266,7 +266,7 @@ STDAPI DllRegisterServer()
         }
 
         wchar_t description[128];
-        swprintf_s(description, L"PS3 Eye Virtual Camera Media Source #%d", i);
+        swprintf_s(description, L"PSCam4Win Virtual Camera Media Source #%d", i);
         RegSetValueExW(key, nullptr, 0, REG_SZ,
                        reinterpret_cast<const BYTE*>(description),
                        static_cast<DWORD>((wcslen(description) + 1) * sizeof(wchar_t)));

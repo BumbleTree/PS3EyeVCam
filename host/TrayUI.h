@@ -4,6 +4,7 @@
 //
 #include <windows.h>
 #include "CaptureController.h"
+#include "../common/DeviceInterfaceGuids.h"
 
 class TrayUI
 {
@@ -12,7 +13,7 @@ public:
     static constexpr UINT WM_CONTROLLER_STATE = WM_APP + 2;  // posted by CaptureController
     static constexpr UINT WM_SHOW_SETTINGS    = WM_APP + 3;  // posted by a second instance
 
-    static constexpr wchar_t kWindowClass[] = L"PS3EyeVCamTrayWnd";
+    static constexpr wchar_t kWindowClass[] = L"PSCam4WinTrayWnd";
 
     bool Create(HINSTANCE instance, CaptureController* controllers);
     void Destroy();
@@ -41,5 +42,7 @@ private:
     CaptureController* _controller = nullptr;
     UINT               _taskbarCreatedMsg = 0;
     bool               _iconAdded = false;
-    HDEVNOTIFY         _devNotify = nullptr;  // PS3 Eye interface arrival/removal
+    // One subscription per camera interface GUID (PS3 Eye + EyeToy); arrival or
+    // removal of any wakes the capture threads to re-evaluate slot occupancy.
+    HDEVNOTIFY         _devNotify[kCameraInterfaceGuidCount] = {};
 };

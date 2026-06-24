@@ -1,6 +1,6 @@
 @echo off
-rem Builds PS3EyeVCam.dll (MF virtual camera media source) and
-rem PS3EyeVCamTray.exe (tray app: capture, sleep/wake, settings, autostart)
+rem Builds PSCam4Win.dll (MF virtual camera media source) and
+rem PSCam4WinTray.exe (tray app: capture, sleep/wake, settings, autostart)
 rem with VS2019 Build Tools. Static CRT (/MT) matches the prebuilt libusb.
 setlocal
 
@@ -15,6 +15,11 @@ rem libusb is vendored in-repo (third_party/libusb): prebuilt 1.0.27 static /MT 
 rem header in include/. See third_party/libusb/README.md. No external repo needed.
 set "LIBUSB_INC=%ROOT%third_party\libusb\include"
 set "LIBUSB_LIB=%ROOT%third_party\libusb\lib\x64\libusb-1.0.lib"
+rem libjpeg-turbo is vendored too (third_party/libjpeg-turbo): prebuilt 3.1.4
+rem static /MT x64 (TurboJPEG API). Used only by the EyeToy JFIF->YUY2 decode.
+rem Each path is quoted (the repo path contains spaces) so the two libs survive
+rem as separate tokens on the link line.
+set TJPEG_LIB="%ROOT%third_party\libjpeg-turbo\lib\x64\turbojpeg.lib" "%ROOT%third_party\libjpeg-turbo\lib\x64\jpeg.lib"
 set "OUT=%ROOT%build"
 if not exist "%OUT%" mkdir "%OUT%"
 
@@ -27,13 +32,13 @@ echo === compiling vendored PS3EYEDriver ===
 cl %CFLAGS% /I "%LIBUSB_INC%" "%ROOT%third_party\ps3eye\ps3eye.cpp" /Fo"%OUT%\ps3eye.obj"
 if errorlevel 1 exit /b 1
 
-echo === compiling PS3EyeVCam.dll ===
+echo === compiling PSCam4Win.dll ===
 cl %CFLAGS% "%ROOT%source\VCamSource.cpp" /Fo"%OUT%\VCamSource.obj"
 if errorlevel 1 exit /b 1
 cl %CFLAGS% "%ROOT%source\dllmain.cpp" /Fo"%OUT%\dllmain.obj"
 if errorlevel 1 exit /b 1
 
-link /nologo /DLL /DEF:"%ROOT%source\PS3EyeVCam.def" /OUT:"%OUT%\PS3EyeVCam.dll" ^
+link /nologo /DLL /DEF:"%ROOT%source\PSCam4Win.def" /OUT:"%OUT%\PSCam4Win.dll" ^
     "%OUT%\VCamSource.obj" "%OUT%\dllmain.obj" ^
     mfplat.lib mfuuid.lib ole32.lib advapi32.lib
 if errorlevel 1 exit /b 1
@@ -42,25 +47,32 @@ echo === compiling resources ===
 rc /nologo /fo "%OUT%\app.res" "%ROOT%res\app.rc"
 if errorlevel 1 exit /b 1
 
-echo === compiling PS3EyeVCamTray.exe ===
+echo === compiling PSCam4WinTray.exe ===
 set HOSTFLAGS=%CFLAGS% /I "%ROOT%third_party\ps3eye" /I "%LIBUSB_INC%"
 cl %HOSTFLAGS% "%ROOT%host\Main.cpp"                /Fo"%OUT%\Main.obj"                || exit /b 1
 cl %HOSTFLAGS% "%ROOT%host\CaptureController.cpp"   /Fo"%OUT%\CaptureController.obj"   || exit /b 1
 cl %HOSTFLAGS% "%ROOT%host\TrayUI.cpp"              /Fo"%OUT%\TrayUI.obj"              || exit /b 1
 cl %HOSTFLAGS% "%ROOT%host\SettingsDialog.cpp"      /Fo"%OUT%\SettingsDialog.obj"      || exit /b 1
 cl %HOSTFLAGS% "%ROOT%host\CameraPreview.cpp"       /Fo"%OUT%\CameraPreview.obj"       || exit /b 1
-cl %HOSTFLAGS% "%ROOT%host\Ps3EyePreviewSource.cpp" /Fo"%OUT%\Ps3EyePreviewSource.obj" || exit /b 1
+cl %HOSTFLAGS% "%ROOT%host\FrameBusPreviewSource.cpp" /Fo"%OUT%\FrameBusPreviewSource.obj" || exit /b 1
 cl %HOSTFLAGS% "%ROOT%host\Autostart.cpp"           /Fo"%OUT%\Autostart.obj"           || exit /b 1
 cl %HOSTFLAGS% "%ROOT%common\Settings.cpp"          /Fo"%OUT%\Settings.obj"            || exit /b 1
+cl %HOSTFLAGS% "%ROOT%host\DeviceProfiles.cpp"      /Fo"%OUT%\DeviceProfiles.obj"      || exit /b 1
+cl %HOSTFLAGS% "%ROOT%host\DeviceRegistry.cpp"      /Fo"%OUT%\DeviceRegistry.obj"      || exit /b 1
+cl %HOSTFLAGS% "%ROOT%transports\usb_bulk\Ps3EyeDevice.cpp" /Fo"%OUT%\Ps3EyeDevice.obj" || exit /b 1
+cl %HOSTFLAGS% "%ROOT%transports\usb_iso\EyeToyUsb.cpp"    /Fo"%OUT%\EyeToyUsb.obj"    || exit /b 1
+cl %HOSTFLAGS% "%ROOT%transports\usb_iso\EyeToyDevice.cpp" /Fo"%OUT%\EyeToyDevice.obj" || exit /b 1
 
 rem /LTCG: the vendored libusb is built with whole-program optimization (/GL);
 rem stating /LTCG here avoids the linker's automatic "restarting link" pass.
-link /nologo /LTCG /SUBSYSTEM:WINDOWS /OUT:"%OUT%\PS3EyeVCamTray.exe" ^
+link /nologo /LTCG /SUBSYSTEM:WINDOWS /OUT:"%OUT%\PSCam4WinTray.exe" ^
     "%OUT%\Main.obj" "%OUT%\CaptureController.obj" "%OUT%\TrayUI.obj" ^
-    "%OUT%\SettingsDialog.obj" "%OUT%\CameraPreview.obj" "%OUT%\Ps3EyePreviewSource.obj" ^
+    "%OUT%\SettingsDialog.obj" "%OUT%\CameraPreview.obj" "%OUT%\FrameBusPreviewSource.obj" ^
     "%OUT%\Autostart.obj" "%OUT%\Settings.obj" ^
+    "%OUT%\DeviceProfiles.obj" "%OUT%\DeviceRegistry.obj" "%OUT%\Ps3EyeDevice.obj" ^
+    "%OUT%\EyeToyUsb.obj" "%OUT%\EyeToyDevice.obj" ^
     "%OUT%\ps3eye.obj" "%OUT%\app.res" ^
-    "%LIBUSB_LIB%" ^
+    "%LIBUSB_LIB%" %TJPEG_LIB% ^
     mfplat.lib mfuuid.lib ole32.lib oleaut32.lib advapi32.lib setupapi.lib ^
     user32.lib gdi32.lib shell32.lib comctl32.lib secur32.lib taskschd.lib uuid.lib ^
     /MANIFEST:EMBED /MANIFESTINPUT:"%ROOT%res\app.manifest" /MANIFESTUAC:NO
@@ -68,7 +80,7 @@ if errorlevel 1 exit /b 1
 
 echo.
 echo build OK:
-echo   %OUT%\PS3EyeVCam.dll
-echo   %OUT%\PS3EyeVCamTray.exe
+echo   %OUT%\PSCam4Win.dll
+echo   %OUT%\PSCam4WinTray.exe
 echo next: run install.bat as Administrator
 endlocal

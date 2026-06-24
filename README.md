@@ -1,31 +1,37 @@
-# PlayStation 3 Eye → Windows Virtual Camera
+# PSCam4Win — PlayStation cameras as Windows Virtual Cameras
 
-This project allows you to use your classic PlayStation 3 Eye camera and its built-in microphone array as a standard web camera and audio input device on modern Windows 11 systems. 
+PSCam4Win lets you use classic PlayStation cameras as standard web cameras (and audio inputs) on modern Windows 11 systems. It currently supports the **PlayStation 3 Eye** and the **PlayStation 2 EyeToy**, behind one common user-space pipeline.
 
-Once installed, the PS3 Eye appears to apps like **Discord, Zoom, OBS, RPCS3 (PS3 Emulator), and web browsers** as a regular built-in camera called **"PS3 Eye (Windows Virtual Camera)"**, and its integrated 4-channel microphone array is exposed as a standard recording device named **"USB Camera-B4.09.24.1"**. It operates entirely in user space (no risky kernel drivers) and is fully safe for Memory Integrity / Core Isolation settings.
+Once installed, each plugged-in camera appears to apps like **Discord, Zoom, OBS, PCSX2 / RPCS3, and web browsers** as a regular built-in camera, named after the device that occupies the slot (e.g. **"PS3 Eye"** or **"PS2 EyeToy"**). The integrated microphones are also exposed as standard recording devices named **"USB Camera-B4.09.24.1"** (for the PS3 Eye's 4-channel array) and **"Logitech EyeToy USB Camera"** (for the PS2 EyeToy). Everything operates in user space (no risky kernel drivers — only Microsoft's inbox WinUSB for video) and is fully safe for Memory Integrity / Core Isolation settings.
+
+> **Device support:** PS3 Eye streams raw Bayer that is debayered to YUY2 in-process; the PS2 EyeToy (OmniVision OV519/OV7648) streams JPEG over WinUSB isochronous and is decoded to YUY2 with libjpeg-turbo. Both ride the same FrameBus → virtual-camera path. PS4/PS5 cameras are planned.
 
 ```
-                              ┌── Interface 0 (MI_00) ── WinUSB ── libusb ── PS3EYEDriver ──► PS3EyeVCamTray.exe
+                              ┌── Interface 0 (MI_00) ── WinUSB ── libusb ── PS3EYEDriver ──► PSCam4WinTray.exe
                               │                                                                 │  Bayer→YUY2
                               │                                                                 ▼
-                              │                                         Global\PS3EyeVCam.FrameBus + .Control (shared memory)
+                              │                                        Global\PSCam4Win{N}.FrameBus + .Control (shared memory)
                               │                                                                 │
                               │                                                                 ▼
-PS3 Eye (Composite Device) ───┤                                                           PS3EyeVCam.dll (in Camera Frame Server)
+PS3 Eye (Composite Device) ───┤                                                            PSCam4Win.dll (in Camera Frame Server)
                               │                                                                 │  YUY2 native / NV12 (on-the-fly)
                               │                                                                 ▼
-                              │                                             "PS3 Eye (Windows Virtual Camera)" in every app
+                              │                                                  "PS3 Eye" virtual camera in every app
                               │
                               └── Interface 1 (MI_01) ── usbaudio.sys ──► "USB Camera-B4.09.24.1" (Microphone) in every app
+
+(The PS2 EyeToy follows the same right-hand path: its JPEG iso stream is reassembled and
+ decoded to YUY2 in PSCam4WinTray.exe, then published to its own Global\PSCam4Win{N}.FrameBus.
+ Its microphone is also automatically driver-mapped via usbaudio.sys to "Logitech EyeToy USB Camera".)
 ```
 
 ---
 
 ## What It Does For You
 
-* **Connect Up to 8 Cameras:** Use up to 8 PS3 Eye cameras at the same time. The virtual cameras appear in your apps automatically only when a physical camera is plugged in, and disappear when unplugged so you never see clutter.
+* **Connect Up to 8 Cameras:** Use up to 8 PlayStation cameras (any mix of PS3 Eye and PS2 EyeToy) at the same time. The virtual cameras appear in your apps automatically only when a physical camera is plugged in, named after whichever device occupies the slot, and disappear when unplugged so you never see clutter.
 * **Smart Sleep & Wake:** The physical cameras automatically power down (turning off the red LED and using 0% CPU) when not in use by any app, and wake up instantly when needed.
-* **Integrated Microphone Support:** Works seamlessly with the PS3 Eye's built-in 4-channel microphone array, exposing it as a standard Windows recording device (**"USB Camera-B4.09.24.1"**) out-of-the-box.
+* **Integrated Microphone Support:** Works seamlessly with the built-in microphones of both devices: the PS3 Eye's 4-channel microphone array (**"USB Camera-B4.09.24.1"**) and the PS2 EyeToy microphone (**"Logitech EyeToy USB Camera"**) are both automatically exposed as standard Windows recording devices.
 * **Quick Control from System Tray:** Adjust camera settings easily via a menu right next to your Windows clock.
 * **Auto-Saved Settings:** Your adjustments for mirroring, gain, exposure, and white balance are automatically remembered for each camera.
 * **Silent Windows Startup:** Launches quietly when you log in without showing any annoying security prompts.
@@ -39,8 +45,9 @@ PS3 Eye (Composite Device) ───┤                                         
 1. Make sure you have built the binaries (run `build.bat` first if you are compiling from source).
 2. Right-click [install.bat] and choose **Run as administrator** (or double-click it and accept the prompt).
 3. The installer will:
-   * Copy files to `C:\Program Files\PS3EyeVCam` (required for system camera integration).
-   * Install the necessary WinUSB video driver automatically.
+   * Upgrade any older **PS3EyeVCam** install in place (migrating your saved per-camera settings, then removing the old app, task, and registration).
+   * Copy files to `C:\Program Files\PSCam4Win` (required for system camera integration).
+   * Install the WinUSB video drivers for both the PS3 Eye and the PS2 EyeToy automatically.
    * Register the Virtual Camera DLL (handling all 8 camera CLSIDs).
    * Create an Add/Remove Programs entry in the Windows Registry.
    * Set up a silent logon task to launch the control tray app at Windows startup.
@@ -48,8 +55,8 @@ PS3 Eye (Composite Device) ───┤                                         
 
 ### Uninstallation
 If you want to cleanly remove it from your system:
-1. Double-click [uninstall.bat] (or run the copy inside `C:\Program Files\PS3EyeVCam`).
-2. It will stop the services, delete scheduled tasks, remove registry entries (including the Add/Remove Programs entry), remove the video driver, unregister all CLSIDs, clean up the certificate, and delete all copied files.
+1. Double-click [uninstall.bat] (or run the copy inside `C:\Program Files\PSCam4Win`).
+2. It will stop the services, delete scheduled tasks, remove registry entries (including the Add/Remove Programs entry), remove both video drivers, unregister all CLSIDs, clean up the certificates, and delete all copied files.
 
 ---
 
@@ -80,7 +87,7 @@ Once installed, look for the **PS3 Eye camera icon** in your Windows System Tray
 2. Open **RPCS3** and go to **Settings** > **I/O**.
 3. Set **Camera Handler** to **Qt** and select **PS3 Eye (Windows Virtual Camera)** as the device.
 4. Ensure camera access is allowed under Windows Settings (*Privacy & security* > *Camera* > *Allow desktop apps to access your camera*).
-5. For microphone support in RPCS3, go to **Settings** > **Audio**, configure your microphone handler (e.g., **USBD** or standard Windows audio input), and select the **USB Camera-B4.09.24.1** as the recording device.
+5. For microphone support in RPCS3 or PCSX2, go to the emulator's audio settings, configure the microphone handler (e.g., **USBD** or standard Windows audio input), and select the appropriate recording device (**USB Camera-B4.09.24.1** for PS3 Eye, or **Logitech EyeToy USB Camera** for PS2 EyeToy).
 
 ---
 
@@ -108,11 +115,11 @@ Once installed, look for the **PS3 Eye camera icon** in your Windows System Tray
 
 ### Multi-Camera Routing
 * The host daemon spawns an independent thread for each physical camera `i` (0 to 7) mapped dynamically. 
-* Each thread registers a virtual camera using the static class ID `CLSID_PS3EyeVCams[i]`, and communicates over custom slot-specific IPC channels: `Global\PS3EyeVCam[i].FrameBus` and `Global\PS3EyeVCam[i].Control`.
+* Each thread registers a virtual camera using the static class ID `CLSID_PS3EyeVCams[i]` (GUIDs retained across the rebrand to avoid COM re-registration), and communicates over custom slot-specific IPC channels: `Global\PSCam4Win[i].FrameBus` and `Global\PSCam4Win[i].Control`. The friendly name shown to apps is chosen per slot from the occupying device's profile.
 * The virtual camera registers (`IMFVirtualCamera`) dynamically *only* when a physical camera is connected to a slot, and unregisters it on removal. This ensures client applications see exactly the number of cameras physically plugged in. Camera arrival and removal are event-driven via WinUSB device interface notifications fanned out to per-slot controllers (with a 5-second polling fallback for empty slots).
 
 ### High-Performance IPC (FrameBus)
-* **Sub-Millisecond Latency via Auto-Reset Events:** Video frames are passed from the capture thread to the virtual camera DLL via a lock-free shared-memory queue (`FrameBus`). The reader waits on a per-camera auto-reset event (`Global\PS3EyeVCam[N].FrameReady`) with restricted ACLs rather than polling or sleeping, avoiding the 15.6 ms system timer quantum. This allows high-speed modes (100–187 fps) to achieve their full target framerate with sub-millisecond latency.
+* **Sub-Millisecond Latency via Auto-Reset Events:** Video frames are passed from the capture thread to the virtual camera DLL via a lock-free shared-memory queue (`FrameBus`). The reader waits on a per-camera auto-reset event (`Global\PSCam4Win[N].FrameReady`) with restricted ACLs rather than polling or sleeping, avoiding the 15.6 ms system timer quantum. This allows high-speed modes (100–187 fps) to achieve their full target framerate with sub-millisecond latency.
 * **Sleep/Wake Coordination:** Sleep/wake state is coordinated via a shared keepalive timestamp (`common\ControlBus.h`). If the virtual camera DLL stops requesting frames, the tray app puts the hardware to sleep after ~3 seconds.
 
 ### On-the-Fly Image Processing & Color Conversion
@@ -123,10 +130,10 @@ Once installed, look for the **PS3 Eye camera icon** in your Windows System Tray
 
 ### USB Bandwidth & Device Configuration
 * **USB Bandwidth Bottlenecks:** Each PS3 Eye camera requires ~185 Mbps of USB bandwidth at 640x480 @ 60 FPS. Although modern PCs use USB 3.x (xHCI) ports, the PS3 Eye is a USB 2.0 High-Speed device and is restricted to the USB 2.0 protocol layer, which shares a 480 Mbps bandwidth pool on the controller's High-Speed bus. A single physical controller can therefore support at most 2 cameras before saturating the bus. To run 3 to 8 cameras concurrently, you must distribute the cameras across separate USB controllers (e.g., separating them between rear motherboard ports, front panel ports, or dedicated PCIe USB expansion cards).
-* **Composite Device Mapping:** The PS3 Eye is a composite USB device. Interface 0 (`MI_00`) handles video streaming via WinUSB and the tray app, while Interface 1 (`MI_01`) is automatically mapped to standard Windows USB Audio (`usbaudio.sys`) to expose the 4-channel microphone array.
+* **Composite Device Mapping:** Both the PS3 Eye and the PS2 EyeToy are composite USB devices. For both cameras, Interface 0 (`MI_00`) handles video streaming (via WinUSB and the tray app), while Interface 1 (`MI_01`) is automatically handled by the standard Windows USB Audio driver (`usbaudio.sys`) to expose their respective microphones.
 
 ### System Integration & OS Details
-* **Security & Permissions:** The virtual camera media source DLL (`PS3EyeVCam.dll`) runs inside the **Camera Frame Server service** (`LOCAL SERVICE`). The tray app requires admin rights to create IPC objects in the `Global\` kernel namespace.
+* **Security & Permissions:** The virtual camera media source DLL (`PSCam4Win.dll`) runs inside the **Camera Frame Server service** (`LOCAL SERVICE`). The tray app requires admin rights to create IPC objects in the `Global\` kernel namespace.
 * **Startup Task:** The startup task uses the `ITaskService` COM API instead of `schtasks.exe` to bypass battery limits and execution duration limits.
 
 ---

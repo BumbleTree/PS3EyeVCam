@@ -26,6 +26,10 @@
 #define IDC_TESTPATTERN       227
 #define IDC_RESET             229
 #define IDC_PREVIEW           230
+#define IDC_BRIGHTNESS_SLIDER 231
+#define IDC_BRIGHTNESS_LABEL  232
+#define IDC_SATURATION_SLIDER 233
+#define IDC_SATURATION_LABEL  234
 
 // Tray menu commands (menu built dynamically)
 #define IDM_SETTINGS        300
