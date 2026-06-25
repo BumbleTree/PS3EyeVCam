@@ -14,14 +14,6 @@ if %errorlevel% neq 0 (
     exit /b
 )
 
-:: Already elevated here. If not running the temp copy, copy to temp and run
-:: from there so we don't lock %DEST% (the started child inherits elevation).
-if /i "%~nx0" neq "uninstall_temp.bat" (
-    copy /y "%~f0" "%temp%\uninstall_temp.bat" >nul
-    start "" "%temp%\uninstall_temp.bat"
-    exit /b
-)
-
 cd /d "%~dp0"
 
 set "DEST=%ProgramFiles%\PSCam4Win"
@@ -86,6 +78,5 @@ echo.
 pause
 endlocal
 
-:: Self-delete the temp copy: "(goto) 2>nul" ends batch-file parsing while the
-:: rest of the line still runs in the parent cmd context.
-(goto) 2>nul & del "%~f0"
+:: Clean up directory in the background after we exit (so file handles are released)
+start /b "" cmd /c "ping -n 3 127.0.0.1 >nul & rmdir /s /q "%DEST%""

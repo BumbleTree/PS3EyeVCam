@@ -4,9 +4,43 @@ rem PSCam4WinTray.exe (tray app: capture, sleep/wake, settings, autostart)
 rem with VS2019 Build Tools. Static CRT (/MT) matches the prebuilt libusb.
 setlocal
 
-call "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul
+rem ---- Locate VS compiler using vswhere -------------------------------------
+set "VS_PATH="
+set "VCVARS_PATH="
+if exist "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" (
+    "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath > "%temp%\vs_path.txt" 2>nul
+    if exist "%temp%\vs_path.txt" (
+        set /p VS_PATH=<"%temp%\vs_path.txt"
+        del "%temp%\vs_path.txt"
+    )
+)
+
+if defined VS_PATH (
+    if exist "%VS_PATH%\VC\Auxiliary\Build\vcvars64.bat" (
+        set "VCVARS_PATH=%VS_PATH%\VC\Auxiliary\Build\vcvars64.bat"
+    )
+)
+
+rem Fallback to default hardcoded paths if vswhere couldn't find it
+if not defined VCVARS_PATH (
+    if exist "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat" (
+        set "VCVARS_PATH=C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+    ) else if exist "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" (
+        set "VCVARS_PATH=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+    )
+)
+
+if not defined VCVARS_PATH (
+    echo error: could not locate Visual Studio C++ build tools: vcvars64.bat
+    echo Please install Visual Studio 2019 or 2022 with the "Desktop development with C++" workload.
+    pause
+    exit /b 1
+)
+
+call "%VCVARS_PATH%" >nul
 if errorlevel 1 (
-    echo error: could not initialize the VS2019 x64 toolchain
+    echo error: could not initialize the Visual Studio x64 toolchain
+    pause
     exit /b 1
 )
 
