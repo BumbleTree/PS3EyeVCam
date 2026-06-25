@@ -11,6 +11,24 @@ rem - seeds default settings, enables silent elevated start-at-logon
 rem - adds an Add/Remove Programs entry, starts the tray app
 setlocal
 
+rem ---- check Windows version compatibility ----------------------------------
+set "WIN_BUILD=0"
+for /f "tokens=3" %%a in ('reg query "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion" /v CurrentBuild 2^>nul') do (
+    set "WIN_BUILD=%%a"
+)
+if %WIN_BUILD% lss 22000 (
+    echo.
+    echo ======================================================================
+    echo error: PSCam4Win requires Windows 11 (build 22000 or higher).
+    echo.
+    echo Windows 10 is not supported because it lacks the Media Foundation
+    echo Virtual Camera API (IMFVirtualCamera).
+    echo ======================================================================
+    echo.
+    pause
+    exit /b 1
+)
+
 net session >nul 2>&1
 if %errorlevel% neq 0 (
     echo Requesting administrative privileges...
@@ -92,7 +110,11 @@ call :copyFile "%~dp0driver\amd64\winusbcoinstaller2.dll"    "%DEST%\driver\amd6
 echo Registering Virtual Camera DLL...
 regsvr32 /s "%DEST%\PSCam4Win.dll"
 if errorlevel 1 (
-    echo error: regsvr32 failed
+    echo.
+    echo error: regsvr32 failed to register the virtual camera DLL.
+    echo This can happen if the installer is not running with administrative privileges,
+    echo or if required system components/runtimes are missing.
+    echo.
     pause
     exit /b 1
 )
@@ -210,7 +232,13 @@ rem copyFile <source> <destination-dir>  -- copy with a loud failure
 :copyFile
 copy /y %1 %2 >nul
 if errorlevel 1 (
-    echo error: could not copy %~nx1 - file in use?
+    echo.
+    echo error: could not copy %~nx1
+    echo Please make sure:
+    echo 1. You ran this installer as Administrator (Right-click -> Run as administrator).
+    echo 2. The camera is not currently being used by any application (OBS, Discord, Zoom, RPCS3, etc.).
+    echo 3. The PSCam4WinTray app is completely closed.
+    echo.
     pause
     exit /b 1
 )
