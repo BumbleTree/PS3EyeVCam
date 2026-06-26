@@ -19,10 +19,10 @@ for /f "tokens=3" %%a in ('reg query "HKLM\SOFTWARE\Microsoft\Windows NT\Current
 if %WIN_BUILD% lss 22000 (
     echo.
     echo ======================================================================
-    echo error: PSCam4Win requires Windows 11 (build 22000 or higher).
+    echo error: PSCam4Win requires Windows 11 ^(build 22000 or higher^).
     echo.
     echo Windows 10 is not supported because it lacks the Media Foundation
-    echo Virtual Camera API (IMFVirtualCamera).
+    echo Virtual Camera API ^(IMFVirtualCamera^).
     echo ======================================================================
     echo.
     pause
@@ -235,8 +235,8 @@ if errorlevel 1 (
     echo.
     echo error: could not copy %~nx1
     echo Please make sure:
-    echo 1. You ran this installer as Administrator (Right-click -> Run as administrator).
-    echo 2. The camera is not currently being used by any application (OBS, Discord, Zoom, RPCS3, etc.).
+    echo 1. You ran this installer as Administrator ^(Right-click -> Run as administrator^).
+    echo 2. The camera is not currently being used by any application ^(OBS, Discord, Zoom, RPCS3, etc.^).
     echo 3. The PSCam4WinTray app is completely closed.
     echo.
     pause
